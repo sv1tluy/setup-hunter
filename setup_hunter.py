@@ -1,24 +1,15 @@
-BOT_TOKEN = "8773030425:AAGNwPdc3NK9h2LmP-R-9ny9UgaTMilMJR0"
-CHAT_ID = "8707344733"
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Error sending TG message: {e}")
-from flask import Flask
-app = Flask(__name__)
-
 import os
 import time
+import threading
 import requests
 import pandas as pd
 import mplfinance as mpf
 import yfinance as yf
 import ccxt
 from datetime import datetime, timezone
+from flask import Flask, jsonify
+
+app = Flask(__name__)
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = "8773030425:AAGNwPdc3NK9h2LmP-R-9ny9UgaTMilMJR0"
@@ -33,6 +24,26 @@ FOREX_SYMBOLS = {
 CRYPTO_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
 binance = ccxt.binance()
+
+# Глобальное хранилище для Web App
+market_data = {
+    "EURUSD": "Инициализация...",
+    "GBPUSD": "Инициализация...",
+    "XAUUSD": "Инициализация...",
+    "BTCUSDT": "Инициализация...",
+    "ETHUSDT": "Инициализация...",
+    "SOLUSDT": "Инициализация...",
+    "last_update": "Только что"
+}
+
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        print(f"Telegram response: {response.status_code}")
+    except Exception as e:
+        print(f"Error sending TG message: {e}")
 
 def get_forex_data(ticker_symbol, timeframe):
     interval = '15m' if timeframe == '15M' else '60m'
@@ -144,37 +155,47 @@ def analyze_and_notify():
     print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Сканирование рынка...")
     
     for name, ticker in FOREX_SYMBOLS.items():
+        market_data[name] = "Сканирование..."
         try:
             df_4h = get_forex_data(ticker, '4H')
             df_15m = get_forex_data(ticker, '15M')
             process_pair(name, df_4h, df_15m)
         except Exception as e:
+            market_data[name] = f"Ошибка: {e}"
             print(f"Ошибка {name}: {e}")
 
     for pair in CRYPTO_SYMBOLS:
+        name = pair.replace('/', '')
+        market_data[name] = "Сканирование..."
         try:
-            name = pair.replace('/', '')
             df_4h = get_crypto_data(pair, '4H')
             df_15m = get_crypto_data(pair, '15M')
             process_pair(name, df_4h, df_15m)
         except Exception as e:
+            market_data[name] = f"Ошибка: {e}"
             print(f"Ошибка {pair}: {e}")
+            
+    market_data["last_update"] = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
 
 def process_pair(symbol, df_4h, df_15m):
     if df_4h is None or df_15m is None or len(df_15m) < 5:
+        market_data[symbol] = "Нет данных"
         return
 
     sweep_4h = check_sweep(df_4h)
     fvg_15m = find_fvg(df_15m)
 
     if not fvg_15m:
+        market_data[symbol] = "Ожидание FVG"
         return
 
     last_fvg = fvg_15m[-1]
     
     if df_15m.index.get_loc(last_fvg['time']) >= len(df_15m) - 3:
         trigger = "Sweep" if sweep_4h else "FVG"
-        direction = "Лонг-сетап" if last_fvg['type'] == 'Bullish FVG' else "Шорт-сетап"
+        direction = "Лонг" if last_fvg['type'] == 'Bullish FVG' else "Шорт"
+        
+        market_data[symbol] = f"🔥 {direction} ({trigger})"
 
         img_4h = f"{symbol}_4H.png"
         img_15m = f"{symbol}_15M.png"
@@ -186,7 +207,7 @@ def process_pair(symbol, df_4h, df_15m):
             f"🎯 <b>{symbol} · 4H Trigger + 15M FVG</b>\n"
             f"<b>{direction} сформирован</b>\n"
             f"Триггер: {trigger}\n"
-            f"Время алерта: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+            f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
         )
 
         send_telegram_media_group([img_4h, img_15m], caption)
@@ -194,37 +215,14 @@ def process_pair(symbol, df_4h, df_15m):
 
         if os.path.exists(img_4h): os.remove(img_4h)
         if os.path.exists(img_15m): os.remove(img_15m)
+    else:
+        market_data[symbol] = "Активен (ожидание)"
 
-if __name__ == "__main__":
-    while True:
-        analyze_and_notify()
-        time.sleep(300) # Проверка каждые 5 минут
-
-# Обеспечиваем доступность app для Gunicorn на Render
-if 'app' not in globals() and 'application' in globals():
-    app = application
-
-if __name__ == '__main__':
-    import os
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
-
-from flask import Flask, jsonify
-
-# Хранилище последних данных от сканера
-market_data = {
-    "EURUSD": "Сканирование...",
-    "GBPUSD": "Сканирование...",
-    "XAUUSD": "Сканирование...",
-    "last_update": "Только что"
-}
-
-# 1. API эндпоинт для получения свежих данных в Web App
+# Flask Routes
 @app.route('/api/status')
 def get_status():
     return jsonify(market_data)
 
-# 2. Обновленный HTML с авто-обновлением каждые 5 секунд
 WEBAPP_HTML = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -240,7 +238,9 @@ WEBAPP_HTML = """
         .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 12px; border: 1px solid #334155; }
         .status { color: #4ade80; font-weight: bold; }
         .symbol { font-weight: bold; color: #f1f5f9; }
-        .setup-val { color: #38bdf8; font-weight: 600; }
+        .setup-val { color: #38bdf8; font-weight: 600; float: right; }
+        .market-row { padding: 6px 0; border-bottom: 1px solid #334155; font-size: 14px; }
+        .market-row:last-child { border-bottom: none; }
         button { background: #0284c7; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: bold; width: 100%; cursor: pointer; margin-top: 10px; }
     </style>
 </head>
@@ -249,10 +249,13 @@ WEBAPP_HTML = """
     <div class="subtitle">Статус: <span class="status">🟢 Онлайн (24/7)</span></div>
     
     <div class="card">
-        <h3 style="margin-top:0;">Мониторинг рынков</h3>
-        <p><span class="symbol">• EURUSD:</span> <span id="eurusd" class="setup-val">Загрузка...</span></p>
-        <p><span class="symbol">• GBPUSD:</span> <span id="gbpusd" class="setup-val">Загрузка...</span></p>
-        <p><span class="symbol">• XAUUSD:</span> <span id="xauusd" class="setup-val">Загрузка...</span></p>
+        <h3 style="margin-top:0; font-size:16px; color:#38bdf8;">Мониторинг рынков</h3>
+        <div class="market-row"><span class="symbol">EURUSD:</span> <span id="eurusd" class="setup-val">Загрузка...</span></div>
+        <div class="market-row"><span class="symbol">GBPUSD:</span> <span id="gbpusd" class="setup-val">Загрузка...</span></div>
+        <div class="market-row"><span class="symbol">XAUUSD:</span> <span id="xauusd" class="setup-val">Загрузка...</span></div>
+        <div class="market-row"><span class="symbol">BTCUSDT:</span> <span id="btcusdt" class="setup-val">Загрузка...</span></div>
+        <div class="market-row"><span class="symbol">ETHUSDT:</span> <span id="ethusdt" class="setup-val">Загрузка...</span></div>
+        <div class="market-row"><span class="symbol">SOLUSDT:</span> <span id="solusdt" class="setup-val">Загрузка...</span></div>
     </div>
 
     <button onclick="window.Telegram.WebApp.close()">Закрыть панель</button>
@@ -265,15 +268,17 @@ WEBAPP_HTML = """
             try {
                 let res = await fetch('/api/status');
                 let data = await res.json();
-                document.getElementById('eurusd').innerText = data.EURUSD;
-                document.getElementById('gbpusd').innerText = data.GBPUSD;
-                document.getElementById('xauusd').innerText = data.XAUUSD;
+                document.getElementById('eurusd').innerText = data.EURUSD || '...';
+                document.getElementById('gbpusd').innerText = data.GBPUSD || '...';
+                document.getElementById('xauusd').innerText = data.XAUUSD || '...';
+                document.getElementById('btcusdt').innerText = data.BTCUSDT || '...';
+                document.getElementById('ethusdt').innerText = data.ETHUSDT || '...';
+                document.getElementById('solusdt').innerText = data.SOLUSDT || '...';
             } catch (e) {
                 console.error("Ошибка загрузки данных", e);
             }
         }
 
-        // Загружаем сразу и обновляем каждые 5 секунд
         updateData();
         setInterval(updateData, 5000);
     </script>
@@ -284,3 +289,19 @@ WEBAPP_HTML = """
 @app.route('/')
 def home():
     return WEBAPP_HTML
+
+# Запуск фонового потока сканирования при старте Gunicorn/Flask
+def run_scanner_background():
+    time.sleep(3)
+    while True:
+        try:
+            analyze_and_notify()
+        except Exception as e:
+            print(f"Scanner error: {e}")
+        time.sleep(300)
+
+threading.Thread(target=run_scanner_background, daemon=True).start()
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
