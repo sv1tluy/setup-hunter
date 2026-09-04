@@ -16,12 +16,16 @@ BOT_TOKEN = "8773030425:AAGNwPdc3NK9h2LmP-R-9ny9UgaTMilMJR0"
 CHAT_ID = "8707344733"
 
 FOREX_SYMBOLS = {
-    'EURUSD': 'EURUSD=X',
-    'GBPUSD': 'GBPUSD=X',
-    'XAUUSD': 'GC=F'
+    'EURUSD': {'ticker': 'EURUSD=X', 'tv': 'OANDA:EURUSD'},
+    'GBPUSD': {'ticker': 'GBPUSD=X', 'tv': 'OANDA:GBPUSD'},
+    'XAUUSD': {'ticker': 'GC=F', 'tv': 'CAPITALCOM:XAUUSD'}
 }
 
-CRYPTO_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+CRYPTO_SYMBOLS = [
+    {'pair': 'BTC/USDT', 'name': 'BTCUSDT', 'tv': 'BINANCE:BTCUSDT'},
+    {'pair': 'ETH/USDT', 'name': 'ETHUSDT', 'tv': 'BINANCE:ETHUSDT'},
+    {'pair': 'SOL/USDT', 'name': 'SOLUSDT', 'tv': 'BINANCE:SOLUSDT'}
+]
 
 binance = ccxt.binance()
 
@@ -38,15 +42,6 @@ market_data = {
 
 # Словарь для защиты от повторной отправки одинаковых сетапов
 last_sent_fvg = {}
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        print(f"Telegram response: {response.status_code}")
-    except Exception as e:
-        print(f"Error sending TG message: {e}")
 
 def get_forex_data(ticker_symbol, timeframe):
     interval = '15m' if timeframe == '15M' else '60m'
@@ -128,7 +123,7 @@ def render_chart(df, title, filename):
         figratio=(12, 7)
     )
 
-def send_telegram_media_group(photos, caption):
+def send_telegram_media_group_with_button(photos, caption, tv_url):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMediaGroup"
     media = []
     files = {}
@@ -144,8 +139,14 @@ def send_telegram_media_group(photos, caption):
         
     payload = {
         'chat_id': CHAT_ID,
-        'media': str(media).replace("'", '"')
+        'media': str(media).replace("'", '"'),
+        'reply_markup': str({
+            "inline_keyboard": [
+                [{"text": "📊 Открыть в TradingView", "url": tv_url}]
+            ]
+        }).replace("'", '"')
     }
+    
     try:
         requests.post(url, data=payload, files=files, timeout=15)
     except Exception as e:
@@ -157,30 +158,30 @@ def send_telegram_media_group(photos, caption):
 def analyze_and_notify():
     print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Сканирование рынка...")
     
-    for name, ticker in FOREX_SYMBOLS.items():
+    for name, info in FOREX_SYMBOLS.items():
         market_data[name] = "Сканирование..."
         try:
-            df_4h = get_forex_data(ticker, '4H')
-            df_15m = get_forex_data(ticker, '15M')
-            process_pair(name, df_4h, df_15m)
+            df_4h = get_forex_data(info['ticker'], '4H')
+            df_15m = get_forex_data(info['ticker'], '15M')
+            process_pair(name, df_4h, df_15m, info['tv'])
         except Exception as e:
             market_data[name] = f"Ошибка: {e}"
             print(f"Ошибка {name}: {e}")
 
-    for pair in CRYPTO_SYMBOLS:
-        name = pair.replace('/', '')
+    for item in CRYPTO_SYMBOLS:
+        name = item['name']
         market_data[name] = "Сканирование..."
         try:
-            df_4h = get_crypto_data(pair, '4H')
-            df_15m = get_crypto_data(pair, '15M')
-            process_pair(name, df_4h, df_15m)
+            df_4h = get_crypto_data(item['pair'], '4H')
+            df_15m = get_crypto_data(item['pair'], '15M')
+            process_pair(name, df_4h, df_15m, item['tv'])
         except Exception as e:
             market_data[name] = f"Ошибка: {e}"
-            print(f"Ошибка {pair}: {e}")
+            print(f"Ошибка {name}: {e}")
             
     market_data["last_update"] = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
 
-def process_pair(symbol, df_4h, df_15m):
+def process_pair(symbol, df_4h, df_15m, tv_symbol):
     if df_4h is None or df_15m is None or len(df_15m) < 5:
         market_data[symbol] = "Нет данных"
         return
@@ -210,14 +211,16 @@ def process_pair(symbol, df_4h, df_15m):
         render_chart(df_4h, f"{symbol} · 4H Context", img_4h)
         render_chart(df_15m, f"{symbol} · 15M Trigger", img_15m)
 
+        tv_url = f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
+
         caption = (
-            f"🎯 <b>{symbol} · 4H Trigger + 15M FVG</b>\n"
-            f"<b>{direction} сформирован</b>\n"
+            f"● <b>{symbol} · 4H Trigger + 15M FVG</b>\n"
+            f"<b>{direction}-сетап сформирован</b>\n"
             f"Триггер: {trigger}\n"
-            f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+            f"Время алерта: {datetime.now(timezone.utc).strftime('%H:%M UTC+0')}\n"
         )
 
-        send_telegram_media_group([img_4h, img_15m], caption)
+        send_telegram_media_group_with_button([img_4h, img_15m], caption, tv_url)
         print(f"✅ Алерт по {symbol} отправлен!")
 
         last_sent_fvg[symbol] = fvg_key
@@ -303,7 +306,6 @@ WEBAPP_HTML = """
 
         function openTradingView(ticker) {
             let tvUrl = `https://www.tradingview.com/chart/?symbol=${ticker}`;
-            // Открываем ссылку во внешнем браузере, чтобы гарантированно кинуть пользователя на сайт/приложение TradingView
             tg.openLink(tvUrl);
         }
 
