@@ -25,7 +25,7 @@ CRYPTO_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
 binance = ccxt.binance()
 
-# Глобальное хранилище для Web App (ключи крипты приведены к формату без слэша)
+# Глобальное хранилище для Web App
 market_data = {
     "EURUSD": "Инициализация...",
     "GBPUSD": "Инициализация...",
@@ -94,7 +94,7 @@ def find_fvg(df):
             fvg_list.append({
                 'type': 'Bearish FVG',
                 'top': df['Low'].iloc[i-2],
-                'bottom': df['Low'].iloc[i], # исправлено для корректного низа медвежьего FVG
+                'bottom': df['Low'].iloc[i],
                 'time': df.index[i]
             })
     return fvg_list
@@ -155,9 +155,8 @@ def send_telegram_media_group(photos, caption):
             f.close()
 
 def analyze_and_notify():
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Сканирование рынка (Forex + Crypto)...")
+    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Сканирование рынка...")
     
-    # Сканирование Форекс и золота
     for name, ticker in FOREX_SYMBOLS.items():
         market_data[name] = "Сканирование..."
         try:
@@ -168,9 +167,8 @@ def analyze_and_notify():
             market_data[name] = f"Ошибка: {e}"
             print(f"Ошибка {name}: {e}")
 
-    # Сканирование Криптовалюты
     for pair in CRYPTO_SYMBOLS:
-        name = pair.replace('/', '') # BTC/USDT -> BTCUSDT
+        name = pair.replace('/', '')
         market_data[name] = "Сканирование..."
         try:
             df_4h = get_crypto_data(pair, '4H')
@@ -202,10 +200,9 @@ def process_pair(symbol, df_4h, df_15m):
         
         market_data[symbol] = f"🔥 {direction} ({trigger})"
 
-        # Проверка на повторную отправку по времени свечи FVG
         fvg_key = f"{symbol}_{last_fvg['time']}"
         if last_sent_fvg.get(symbol) == fvg_key:
-            return  # Уже отправляли этот сетап, пропускаем
+            return  
 
         img_4h = f"{symbol}_4H.png"
         img_15m = f"{symbol}_15M.png"
@@ -223,7 +220,6 @@ def process_pair(symbol, df_4h, df_15m):
         send_telegram_media_group([img_4h, img_15m], caption)
         print(f"✅ Алерт по {symbol} отправлен!")
 
-        # Сохраняем информацию об отправке
         last_sent_fvg[symbol] = fvg_key
 
         if os.path.exists(img_4h): os.remove(img_4h)
@@ -250,10 +246,23 @@ WEBAPP_HTML = """
         .subtitle { color: #94a3b8; font-size: 12px; margin-bottom: 16px; }
         .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 12px; border: 1px solid #334155; }
         .status { color: #4ade80; font-weight: bold; }
-        .symbol { font-weight: bold; color: #f1f5f9; }
-        .setup-val { color: #38bdf8; font-weight: 600; float: right; }
-        .market-row { padding: 6px 0; border-bottom: 1px solid #334155; font-size: 14px; }
+        .market-row { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            padding: 10px 8px; 
+            border-bottom: 1px solid #334155; 
+            font-size: 14px; 
+            cursor: pointer;
+            border-radius: 6px;
+            transition: background 0.2s;
+        }
+        .market-row:hover { background: #334155; }
         .market-row:last-child { border-bottom: none; }
+        .symbol { font-weight: bold; color: #f1f5f9; display: flex; align-items: center; gap: 6px; }
+        .symbol::after { content: "↗"; font-size: 11px; color: #94a3b8; }
+        .setup-val { color: #38bdf8; font-weight: 600; text-align: right; }
+        .hint { font-size: 11px; color: #64748b; text-align: center; margin-top: 6px; }
         button { background: #0284c7; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: bold; width: 100%; cursor: pointer; margin-top: 10px; }
     </style>
 </head>
@@ -262,13 +271,28 @@ WEBAPP_HTML = """
     <div class="subtitle">Статус: <span class="status">🟢 Онлайн (24/7)</span></div>
     
     <div class="card">
-        <h3 style="margin-top:0; font-size:16px; color:#38bdf8;">Мониторинг рынков</h3>
-        <div class="market-row"><span class="symbol">EURUSD:</span> <span id="eurusd" class="setup-val">Загрузка...</span></div>
-        <div class="market-row"><span class="symbol">GBPUSD:</span> <span id="gbpusd" class="setup-val">Загрузка...</span></div>
-        <div class="market-row"><span class="symbol">XAUUSD:</span> <span id="xauusd" class="setup-val">Загрузка...</span></div>
-        <div class="market-row"><span class="symbol">BTCUSDT:</span> <span id="btcusdt" class="setup-val">Загрузка...</span></div>
-        <div class="market-row"><span class="symbol">ETHUSDT:</span> <span id="ethusdt" class="setup-val">Загрузка...</span></div>
-        <div class="market-row"><span class="symbol">SOLUSDT:</span> <span id="solusdt" class="setup-val">Загрузка...</span></div>
+        <h3 style="margin-top:0; font-size:16px; color:#38bdf8; margin-bottom:12px;">Мониторинг рынков</h3>
+        
+        <div class="market-row" onclick="openTradingView('OANDA:EURUSD')">
+            <span class="symbol">EURUSD</span> <span id="eurusd" class="setup-val">Загрузка...</span>
+        </div>
+        <div class="market-row" onclick="openTradingView('OANDA:GBPUSD')">
+            <span class="symbol">GBPUSD</span> <span id="gbpusd" class="setup-val">Загрузка...</span>
+        </div>
+        <div class="market-row" onclick="openTradingView('CAPITALCOM:XAUUSD')">
+            <span class="symbol">XAUUSD</span> <span id="xauusd" class="setup-val">Загрузка...</span>
+        </div>
+        <div class="market-row" onclick="openTradingView('BINANCE:BTCUSDT')">
+            <span class="symbol">BTCUSDT</span> <span id="btcusdt" class="setup-val">Загрузка...</span>
+        </div>
+        <div class="market-row" onclick="openTradingView('BINANCE:ETHUSDT')">
+            <span class="symbol">ETHUSDT</span> <span id="ethusdt" class="setup-val">Загрузка...</span>
+        </div>
+        <div class="market-row" onclick="openTradingView('BINANCE:SOLUSDT')">
+            <span class="symbol">SOLUSDT</span> <span id="solusdt" class="setup-val">Загрузка...</span>
+        </div>
+        
+        <div class="hint">Нажми на актив, чтобы открыть график в TradingView</div>
     </div>
 
     <button onclick="window.Telegram.WebApp.close()">Закрыть панель</button>
@@ -276,6 +300,12 @@ WEBAPP_HTML = """
     <script>
         let tg = window.Telegram.WebApp;
         tg.expand();
+
+        function openTradingView(ticker) {
+            let tvUrl = `https://www.tradingview.com/chart/?symbol=${ticker}`;
+            // Открываем ссылку во внешнем браузере, чтобы гарантированно кинуть пользователя на сайт/приложение TradingView
+            tg.openLink(tvUrl);
+        }
 
         async function updateData() {
             try {
@@ -303,7 +333,6 @@ WEBAPP_HTML = """
 def home():
     return WEBAPP_HTML
 
-# Запуск фонового потока сканирования при старте Gunicorn/Flask
 def run_scanner_background():
     time.sleep(3)
     while True:
