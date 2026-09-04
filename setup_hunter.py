@@ -209,8 +209,64 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 
-@app.route('/')
+WEBAPP_HTML = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMC Setup Hunter</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        body {
+            background-color: #0f172a;
+            color: #f8fafc;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            margin: 0;
+            padding: 16px;
+        }
+        h1 { color: #38bdf8; font-size: 22px; }
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .status { color: #4ade80; font-weight: bold; }
+        button {
+            background: #0284c7;
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 8px;
+            font-weight: bold;
+            width: 100%;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎯 SMC Setup Hunter</h1>
+    <p>Статус: <span class="status">🟢 Онлайн (24/7)</span></p>
+    
+    <div class="card">
+        <h3>Мониторинг рынков</h3>
+        <p>• EURUSD: Сканирование...</p>
+        <p>• GBPUSD: Сканирование...</p>
+        <p>• XAUUSD: Сканирование...</p>
+    </div>
+
+    <button onclick="window.Telegram.WebApp.close()">Закрыть панель</button>
+
+    <script>
+        let tg = window.Telegram.WebApp;
+        tg.expand();
+    </script>
+</body>
+</html>
+"""
 
 @app.route('/')
-def health_check():
-    return "OK", 200
+def home():
+    return WEBAPP_HTML
