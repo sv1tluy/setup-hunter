@@ -186,3 +186,12 @@ if __name__ == "__main__":
     while True:
         analyze_and_notify()
         time.sleep(300) # Проверка каждые 5 минут
+
+# Обеспечиваем доступность app для Gunicorn на Render
+if 'app' not in globals() and 'application' in globals():
+    app = application
+
+if __name__ == '__main__':
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
