@@ -16,9 +16,9 @@ BOT_TOKEN = "8773030425:AAGNwPdc3NK9h2LmP-R-9ny9UgaTMilMJR0"
 CHAT_ID = "8707344733"
 
 FOREX_SYMBOLS = {
-    'EURUSD': {'ticker': 'EURUSD=X', 'tv': 'OANDA:EURUSD'},
-    'GBPUSD': {'ticker': 'GBPUSD=X', 'tv': 'OANDA:GBPUSD'},
-    'XAUUSD': {'ticker': 'GC=F', 'tv': 'CAPITALCOM:XAUUSD'}
+    'EURUSD': {'ticker': 'EURUSD=X', 'tv': 'OANDA:EURUSD', 'type': 'forex'},
+    'GBPUSD': {'ticker': 'GBPUSD=X', 'tv': 'OANDA:GBPUSD', 'type': 'forex'},
+    'XAUUSD': {'ticker': 'GC=F', 'tv': 'CAPITALCOM:XAUUSD', 'type': 'metal'}
 }
 
 CRYPTO_SYMBOLS = [
@@ -40,8 +40,28 @@ market_data = {
     "last_update": "Только что"
 }
 
-# Словарь для защиты от повторной отправки одинаковых сетапов
 last_sent_fvg = {}
+
+def is_market_open(asset_type):
+    """Проверка, открыт ли рынок (актуально для Форекса и Металлов в выходные)"""
+    if asset_type == 'crypto':
+        return True  
+        
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday() # 0-5 (Пн-Сб), 6 (Вс)
+    hour = now.hour
+    
+    # Суббота полностью закрыта
+    if weekday == 5:
+        return False
+    # Воскресенье до 21:00 UTC закрыто (рынок открывается в вечернее воскресенье)
+    if weekday == 6 and hour < 21:
+        return False
+    # Пятница после 21:30 UTC рынок закрывается
+    if weekday == 4 and hour >= 21:
+        return False
+        
+    return True
 
 def get_forex_data(ticker_symbol, timeframe):
     interval = '15m' if timeframe == '15M' else '60m'
@@ -110,17 +130,31 @@ def check_sweep(df):
     return None
 
 def render_chart(df, title, filename):
-    mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', edge='inherit', wick='inherit', volume='in')
-    style = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc, gridcolor='#2a2e39', facecolor='#131722')
+    # Улучшенный профессиональный стиль графиков (темная тема TradingView-like)
+    mc = mpf.make_marketcolors(
+        up='#26a69a', down='#ef5350', 
+        edge={'up':'#26a69a', 'down':'#ef5350'}, 
+        wick={'up':'#26a69a', 'down':'#ef5350'}, 
+        volume='in'
+    )
+    style = mpf.make_mpf_style(
+        base_mpf_style='nightclouds', 
+        marketcolors=mc, 
+        gridcolor='#1e222d', 
+        facecolor='#131722',
+        figcolor='#131722',
+        edgecolor='#131722'
+    )
     
     mpf.plot(
-        df.tail(40),
+        df.tail(35),
         type='candle',
         style=style,
-        title=f"\n{title}",
-        savefig=filename,
+        title=dict(title=title, color='#f8fafc', fontsize=12, style='normal'),
+        savefig=dict(fname=filename, dpi=300, bbox_inches='tight', facecolor='#131722'),
         volume=False,
-        figratio=(12, 7)
+        figratio=(16, 9),
+        figscale=1.1
     )
 
 def send_telegram_media_group_with_button(photos, caption, tv_url):
@@ -158,7 +192,12 @@ def send_telegram_media_group_with_button(photos, caption, tv_url):
 def analyze_and_notify():
     print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Сканирование рынка...")
     
+    # 1. Сканирование Форекс и металлов
     for name, info in FOREX_SYMBOLS.items():
+        if not is_market_open(info['type']):
+            market_data[name] = "Рынок закрыт 💤"
+            continue
+            
         market_data[name] = "Сканирование..."
         try:
             df_4h = get_forex_data(info['ticker'], '4H')
@@ -168,6 +207,7 @@ def analyze_and_notify():
             market_data[name] = f"Ошибка: {e}"
             print(f"Ошибка {name}: {e}")
 
+    # 2. Сканирование Криптовалюты (работает 24/7)
     for item in CRYPTO_SYMBOLS:
         name = item['name']
         market_data[name] = "Сканирование..."
@@ -304,6 +344,7 @@ WEBAPP_HTML = """
         let tg = window.Telegram.WebApp;
         tg.expand();
 
+        function openTimestamp() {}
         function openTradingView(ticker) {
             let tvUrl = `https://www.tradingview.com/chart/?symbol=${ticker}`;
             tg.openLink(tvUrl);
