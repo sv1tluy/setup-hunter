@@ -204,3 +204,18 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
 EOF
+import requests
+
+RENDER_URL = "https://setup-hunter-xxxx.onrender.com" # Твой URL на Render
+
+def keep_alive():
+    while True:
+        try:
+            requests.get(RENDER_URL, timeout=10)
+            print("Self-ping successful! Keeping Render awake.")
+        except Exception as e:
+            print(f"Self-ping failed: {e}")
+        time.sleep(600) # каждые 10 минут
+
+# Запуск само-пинга в фоновом потоке
+threading.Thread(target=keep_alive, daemon=True).start()
