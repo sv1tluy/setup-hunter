@@ -209,3 +209,8 @@ if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+    # Тестовая отправка при запуске
+send_telegram("🔔 **Тест связи!** Сканер SMC успешно запущен и мониторит EURUSD, GBPUSD и XAUUSD.")
+
+# Запуск фонового сканера
+threading.Thread(target=run_scanner, daemon=True).start()
