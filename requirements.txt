@@ -1,6 +1,10 @@
+cat <<EOF > requirements.txt
 pandas
 pandas-ta
 mplfinance
 requests
 yfinance
 ccxt
+flask
+gunicorn
+EOF
