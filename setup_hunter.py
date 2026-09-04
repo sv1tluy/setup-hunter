@@ -25,7 +25,7 @@ CRYPTO_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
 binance = ccxt.binance()
 
-# Глобальное хранилище для Web App
+# Глобальное хранилище для Web App (ключи крипты приведены к формату без слэша)
 market_data = {
     "EURUSD": "Инициализация...",
     "GBPUSD": "Инициализация...",
@@ -35,6 +35,9 @@ market_data = {
     "SOLUSDT": "Инициализация...",
     "last_update": "Только что"
 }
+
+# Словарь для защиты от повторной отправки одинаковых сетапов
+last_sent_fvg = {}
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -91,7 +94,7 @@ def find_fvg(df):
             fvg_list.append({
                 'type': 'Bearish FVG',
                 'top': df['Low'].iloc[i-2],
-                'bottom': df['High'].iloc[i],
+                'bottom': df['Low'].iloc[i], # исправлено для корректного низа медвежьего FVG
                 'time': df.index[i]
             })
     return fvg_list
@@ -152,8 +155,9 @@ def send_telegram_media_group(photos, caption):
             f.close()
 
 def analyze_and_notify():
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Сканирование рынка...")
+    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] Сканирование рынка (Forex + Crypto)...")
     
+    # Сканирование Форекс и золота
     for name, ticker in FOREX_SYMBOLS.items():
         market_data[name] = "Сканирование..."
         try:
@@ -164,8 +168,9 @@ def analyze_and_notify():
             market_data[name] = f"Ошибка: {e}"
             print(f"Ошибка {name}: {e}")
 
+    # Сканирование Криптовалюты
     for pair in CRYPTO_SYMBOLS:
-        name = pair.replace('/', '')
+        name = pair.replace('/', '') # BTC/USDT -> BTCUSDT
         market_data[name] = "Сканирование..."
         try:
             df_4h = get_crypto_data(pair, '4H')
@@ -197,6 +202,11 @@ def process_pair(symbol, df_4h, df_15m):
         
         market_data[symbol] = f"🔥 {direction} ({trigger})"
 
+        # Проверка на повторную отправку по времени свечи FVG
+        fvg_key = f"{symbol}_{last_fvg['time']}"
+        if last_sent_fvg.get(symbol) == fvg_key:
+            return  # Уже отправляли этот сетап, пропускаем
+
         img_4h = f"{symbol}_4H.png"
         img_15m = f"{symbol}_15M.png"
 
@@ -212,6 +222,9 @@ def process_pair(symbol, df_4h, df_15m):
 
         send_telegram_media_group([img_4h, img_15m], caption)
         print(f"✅ Алерт по {symbol} отправлен!")
+
+        # Сохраняем информацию об отправке
+        last_sent_fvg[symbol] = fvg_key
 
         if os.path.exists(img_4h): os.remove(img_4h)
         if os.path.exists(img_15m): os.remove(img_15m)
