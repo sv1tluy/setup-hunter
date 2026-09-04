@@ -1,13 +1,23 @@
+cat <<'EOF' > setup_hunter.py
 import os
 import time
+import threading
 import requests
 import pandas as pd
 import mplfinance as mpf
 import yfinance as yf
 import ccxt
 from datetime import datetime, timezone
+from flask import Flask
 
-# --- НАСТРОЙКИ ---
+# --- FLASK ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Setup Hunter is running 24/7!"
+
+# --- НАСТРОЙКИ СКАНЕРА ---
 BOT_TOKEN = "8773030425:AAGNwPdc3NK9h2LmP-R-9ny9UgaTMilMJR0"
 CHAT_ID = "8707344733"
 
@@ -182,7 +192,15 @@ def process_pair(symbol, df_4h, df_15m):
         if os.path.exists(img_4h): os.remove(img_4h)
         if os.path.exists(img_15m): os.remove(img_15m)
 
-if __name__ == "__main__":
+def scanner_loop():
     while True:
         analyze_and_notify()
-        time.sleep(300) # Проверка каждые 5 минут
+        time.sleep(300)
+
+# Запуск сканера в отдельном потоке
+threading.Thread(target=scanner_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+EOF
