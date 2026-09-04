@@ -209,6 +209,22 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 
+from flask import Flask, jsonify
+
+# Хранилище последних данных от сканера
+market_data = {
+    "EURUSD": "Сканирование...",
+    "GBPUSD": "Сканирование...",
+    "XAUUSD": "Сканирование...",
+    "last_update": "Только что"
+}
+
+# 1. API эндпоинт для получения свежих данных в Web App
+@app.route('/api/status')
+def get_status():
+    return jsonify(market_data)
+
+# 2. Обновленный HTML с авто-обновлением каждые 5 секунд
 WEBAPP_HTML = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -218,43 +234,25 @@ WEBAPP_HTML = """
     <title>SMC Setup Hunter</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
-        body {
-            background-color: #0f172a;
-            color: #f8fafc;
-            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-            margin: 0;
-            padding: 16px;
-        }
-        h1 { color: #38bdf8; font-size: 22px; }
-        .card {
-            background: #1e293b;
-            border-radius: 12px;
-            padding: 16px;
-            margin-bottom: 12px;
-        }
+        body { background-color: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 16px; }
+        h1 { color: #38bdf8; font-size: 22px; margin-bottom: 4px; }
+        .subtitle { color: #94a3b8; font-size: 12px; margin-bottom: 16px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 12px; border: 1px solid #334155; }
         .status { color: #4ade80; font-weight: bold; }
-        button {
-            background: #0284c7;
-            color: white;
-            border: none;
-            padding: 12px;
-            border-radius: 8px;
-            font-weight: bold;
-            width: 100%;
-            cursor: pointer;
-            margin-top: 10px;
-        }
+        .symbol { font-weight: bold; color: #f1f5f9; }
+        .setup-val { color: #38bdf8; font-weight: 600; }
+        button { background: #0284c7; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: bold; width: 100%; cursor: pointer; margin-top: 10px; }
     </style>
 </head>
 <body>
     <h1>🎯 SMC Setup Hunter</h1>
-    <p>Статус: <span class="status">🟢 Онлайн (24/7)</span></p>
+    <div class="subtitle">Статус: <span class="status">🟢 Онлайн (24/7)</span></div>
     
     <div class="card">
-        <h3>Мониторинг рынков</h3>
-        <p>• EURUSD: Сканирование...</p>
-        <p>• GBPUSD: Сканирование...</p>
-        <p>• XAUUSD: Сканирование...</p>
+        <h3 style="margin-top:0;">Мониторинг рынков</h3>
+        <p><span class="symbol">• EURUSD:</span> <span id="eurusd" class="setup-val">Загрузка...</span></p>
+        <p><span class="symbol">• GBPUSD:</span> <span id="gbpusd" class="setup-val">Загрузка...</span></p>
+        <p><span class="symbol">• XAUUSD:</span> <span id="xauusd" class="setup-val">Загрузка...</span></p>
     </div>
 
     <button onclick="window.Telegram.WebApp.close()">Закрыть панель</button>
@@ -262,6 +260,22 @@ WEBAPP_HTML = """
     <script>
         let tg = window.Telegram.WebApp;
         tg.expand();
+
+        async function updateData() {
+            try {
+                let res = await fetch('/api/status');
+                let data = await res.json();
+                document.getElementById('eurusd').innerText = data.EURUSD;
+                document.getElementById('gbpusd').innerText = data.GBPUSD;
+                document.getElementById('xauusd').innerText = data.XAUUSD;
+            } catch (e) {
+                console.error("Ошибка загрузки данных", e);
+            }
+        }
+
+        // Загружаем сразу и обновляем каждые 5 секунд
+        updateData();
+        setInterval(updateData, 5000);
     </script>
 </body>
 </html>
