@@ -1,0 +1,6 @@
+pandas
+pandas-ta
+mplfinance
+requests
+yfinance
+ccxt
