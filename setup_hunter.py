@@ -769,50 +769,88 @@ def fetch_pair_data(instrument_key: str):
 # =========================================================================
 # AI (Gemini) — TP/SL подсказки
 # =========================================================================
-def get_ai_tp_sl(label: str, direction: str, trigger: str, last_close: float, atr: float = None) -> str:
-    """Короткая подсказка TP/SL для новичка. Если нет ключа — fallback-эвристика."""
-    if not GEMINI_API_KEY:
-        # Простая эвристика без AI
-        if atr and atr > 0:
-            if direction == "Лонг":
-                sl = last_close - 1.5 * atr
-                tp1 = last_close + 2.0 * atr
-                tp2 = last_close + 3.5 * atr
-            else:
-                sl = last_close + 1.5 * atr
-                tp1 = last_close - 2.0 * atr
-                tp2 = last_close - 3.5 * atr
-            return (
-                f"📍 <b>Подсказка (эвристика):</b>\n"
-                f"SL ≈ <code>{sl:.5g}</code>\n"
-                f"TP1 ≈ <code>{tp1:.5g}</code>  |  TP2 ≈ <code>{tp2:.5g}</code>\n"
-                f"<i>Риск 1 : 1.3–2.3. Ставь SL за ближайший свинг.</i>"
-            )
-        return "📍 <i>Укажи GEMINI_API_KEY для умных TP/SL</i>"
+# Модели по приоритету (если одна упёрлась в квоту — пробуем следующую)
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-3.6-flash",
+    "gemini-2.0-flash",
+]
 
+
+def _atr_fallback(direction: str, last_close: float, atr: float = None) -> str:
+    if atr and atr > 0:
+        if direction == "Лонг":
+            sl = last_close - 1.5 * atr
+            tp1 = last_close + 2.0 * atr
+            tp2 = last_close + 3.5 * atr
+        else:
+            sl = last_close + 1.5 * atr
+            tp1 = last_close - 2.0 * atr
+            tp2 = last_close - 3.5 * atr
+        return (
+            f"📍 <b>Подсказка (без AI, ATR):</b>\n"
+            f"SL ≈ <code>{sl:.5g}</code>\n"
+            f"TP1 ≈ <code>{tp1:.5g}</code>  |  TP2 ≈ <code>{tp2:.5g}</code>\n"
+            f"<i>Риск ~1:1.3–2.3. SL за ближайший свинг.</i>"
+        )
+    return "📍 <i>AI недоступен, ATR нет</i>"
+
+
+def _gemini_generate(prompt: str) -> str:
+    """Пробует несколько моделей; при 429/квоте — понятная ошибка."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("no_key")
+    from google import genai
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    last_err = None
+    for model in GEMINI_MODELS:
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            text = (resp.text or "").strip()
+            if text:
+                return text
+        except Exception as e:
+            last_err = e
+            err_s = str(e)
+            log.warning(f"Gemini {model}: {err_s[:180]}")
+            # квота / rate limit — пробуем следующую модель
+            if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s or "quota" in err_s.lower():
+                continue
+            # другие ошибки — тоже пробуем другую модель
+            continue
+    if last_err and ("429" in str(last_err) or "RESOURCE_EXHAUSTED" in str(last_err) or "quota" in str(last_err).lower()):
+        raise RuntimeError("quota")
+    raise RuntimeError(str(last_err) if last_err else "empty")
+
+
+def get_ai_tp_sl(label: str, direction: str, trigger: str, last_close: float, atr: float = None) -> str:
+    """Короткая подсказка TP/SL. При квоте Gemini — ATR-fallback."""
+    if not GEMINI_API_KEY:
+        return _atr_fallback(direction, last_close, atr)
+
+    prompt = (
+        f"Ты опытный трейдер. Инструмент: {label}. "
+        f"Сигнал: {direction}. Триггер: {trigger}. "
+        f"Текущая цена ≈ {last_close}. "
+        f"Дай очень короткий ответ на русском (макс 4 строки) для новичка:\n"
+        f"1) Куда примерно поставить Stop Loss\n"
+        f"2) Take Profit 1 и Take Profit 2\n"
+        f"3) Одно предложение риска/RR.\n"
+        f"Без воды, только практика. Используй HTML-теги <b> и <code> если нужно."
+    )
     try:
-        from google import genai
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        prompt = (
-            f"Ты опытный трейдер. Инструмент: {label}. "
-            f"Сигнал: {direction}. Триггер: {trigger}. "
-            f"Текущая цена ≈ {last_close}. "
-            f"Дай очень короткий ответ на русском (макс 4 строки) для новичка:\n"
-            f"1) Куда примерно поставить Stop Loss\n"
-            f"2) Take Profit 1 и Take Profit 2\n"
-            f"3) Одно предложение риска/RR.\n"
-            f"Без воды, только практика. Используй HTML-теги <b> и <code> если нужно."
-        )
-        resp = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=prompt,
-        )
-        text = (resp.text or "").strip()
-        if text:
-            return f"🤖 <b>AI подсказка:</b>\n{text}"
+        text = _gemini_generate(prompt)
+        return f"🤖 <b>AI подсказка:</b>\n{text}"
+    except RuntimeError as e:
+        if str(e) == "quota":
+            log.warning("Gemini quota exhausted → ATR fallback")
+            return _atr_fallback(direction, last_close, atr) + "\n<i>(квота Gemini на сегодня кончилась)</i>"
+        log.warning(f"Gemini TP/SL: {e}")
+        return _atr_fallback(direction, last_close, atr)
     except Exception as e:
         log.warning(f"Gemini TP/SL error: {e}")
-    return "📍 <i>AI временно недоступен</i>"
+        return _atr_fallback(direction, last_close, atr)
 
 
 def tradingview_url(instrument_key: str) -> str:
@@ -1485,14 +1523,30 @@ AI_SYSTEM_PROMPT = (
 
 def _chat_gemini(user_text: str) -> str:
     if not GEMINI_API_KEY:
-        return "⚠️ GEMINI_API_KEY не задан."
-    from google import genai
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    resp = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=f"{AI_SYSTEM_PROMPT}\n\nПользователь: {user_text}",
-    )
-    return (resp.text or "").strip() or "Пустой ответ."
+        return "⚠️ GEMINI_API_KEY не задан. Добавь ключ в Environment на Render."
+    try:
+        text = _gemini_generate(f"{AI_SYSTEM_PROMPT}\n\nПользователь: {user_text}")
+        return text
+    except RuntimeError as e:
+        if str(e) == "quota":
+            return (
+                "⚠️ <b>Квота Gemini на сегодня закончилась</b> (free tier ~20–50 req/день).\n\n"
+                "Что сделать:\n"
+                "• подожди сброса (обычно по UTC)\n"
+                "• или создай новый ключ в AI Studio\n"
+                "• или переключись: <code>/model</code> → Claude / Grok\n"
+                "• или включи billing в Google AI"
+            )
+        if str(e) == "no_key":
+            return "⚠️ GEMINI_API_KEY не задан."
+        return f"❌ Gemini: {e}"
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "RESOURCE_EXHAUSTED" in err:
+            return (
+                "⚠️ Лимит Gemini (429). Подожди ~1 мин или смени модель: <code>/model</code>"
+            )
+        return f"❌ Gemini: {err[:300]}"
 
 
 def _chat_claude(user_text: str) -> str:
