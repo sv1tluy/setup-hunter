@@ -688,67 +688,227 @@ def get_status():
     return jsonify(market_data)
 
 
-WEBAPP_HTML = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SMC Setup Hunter</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Simple Trading Hub</title>
+    <!-- Chart.js для графика эквити -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Telegram WebApp SDK -->
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
-        body { background-color: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 16px; }
-        h1 { color: #38bdf8; font-size: 22px; margin-bottom: 4px; }
-        .subtitle { color: #94a3b8; font-size: 12px; margin-bottom: 16px; }
-        .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 12px; border: 1px solid #334155; }
-        .status { color: #4ade80; font-weight: bold; }
-        .market-row { padding: 8px 0; border-bottom: 1px solid #334155; font-size: 14px; }
-        .market-row:last-child { border-bottom: none; }
-        .hint { color: #64748b; font-size: 12px; margin-top: 12px; }
-        button { background: #0284c7; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: bold; width: 100%; cursor: pointer; margin-top: 10px; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
+        body { background-color: #0f1115; color: #e1e4ea; padding-bottom: 30px; }
+        
+        /* Banner / Header */
+        .cover { height: 140px; background: url('https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop') center/cover no-repeat; position: relative; }
+        .avatar-container { position: absolute; bottom: -25px; left: 20px; }
+        .avatar { width: 60px; height: 60px; background: #1a1d24; border: 3px solid #0f1115; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 28px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        
+        .content { padding: 40px 16px 16px 16px; }
+        h1 { font-size: 24px; font-weight: 700; color: #ffffff; margin-bottom: 20px; }
+
+        /* Navigation Cards */
+        .section-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: #6c757d; margin: 20px 0 10px 4px; }
+        .nav-card { background: #181b22; border: 1px solid #232730; border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; cursor: pointer; transition: background 0.2s; }
+        .nav-card:active { background: #222631; }
+        .nav-card .left { display: flex; align-items: center; gap: 12px; font-size: 15px; font-weight: 500; color: #d1d5db; }
+        .nav-card .icon { font-size: 18px; }
+
+        /* Modal Views (Секции) */
+        .view { display: none; }
+        .view.active { display: block; }
+        
+        /* Chart Section */
+        .chart-box { background: #181b22; border: 1px solid #232730; border-radius: 14px; padding: 16px; margin-top: 10px; }
+        
+        /* Form & List */
+        .form-group { display: flex; flex-direction: column; gap: 10px; background: #181b22; border: 1px solid #232730; padding: 14px; border-radius: 12px; margin-bottom: 15px; }
+        input, select { background: #0f1115; border: 1px solid #2a2f3d; color: #fff; padding: 10px 12px; border-radius: 8px; outline: none; font-size: 14px; }
+        button { background: #2563eb; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px; }
+        button:active { opacity: 0.8; }
+        .btn-back { background: #232730; color: #9ca3af; margin-bottom: 15px; width: fit-content; padding: 6px 12px; font-size: 13px; }
+
+        .trade-item { background: #181b22; border-left: 4px solid #4b5563; padding: 12px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .trade-item.WIN { border-left-color: #10b981; }
+        .trade-item.LOSS { border-left-color: #ef4444; }
+        .trade-info { font-size: 13px; color: #9ca3af; }
+        .trade-title { font-size: 15px; font-weight: 600; color: #fff; }
+        .pnl { font-weight: 700; font-size: 14px; }
+        .pnl.WIN { color: #10b981; }
+        .pnl.LOSS { color: #ef4444; }
     </style>
 </head>
 <body>
-    <h1>🎯 SMC Setup Hunter</h1>
-    <div class="subtitle">Статус: <span class="status">🟢 Онлайн (24/7)</span></div>
 
-    <div class="card">
-        <h3 style="margin-top:0; font-size:16px; color:#38bdf8;">Мониторинг рынков</h3>
-        <div id="rows">Загрузка...</div>
-        <div class="hint">Настроить сетап и список инструментов — командами /setup и /instruments в чате с ботом.</div>
+    <!-- MAIN DASHBOARD -->
+    <div id="main-view" class="view active">
+        <div class="cover">
+            <div class="avatar-container">
+                <div class="avatar">📖</div>
+            </div>
+        </div>
+        
+        <div class="content">
+            <h1>Simple Trading</h1>
+
+            <div class="section-title">Routine</div>
+            
+            <div class="nav-card" onclick="openView('journal-view')">
+                <div class="left"><span class="icon">📔</span> Journal</div>
+                <span style="color:#4b5563">›</span>
+            </div>
+            
+            <div class="nav-card" onclick="openView('rules-view')">
+                <div class="left"><span class="icon">📈</span> Rules</div>
+                <span style="color:#4b5563">›</span>
+            </div>
+
+            <div class="section-title">Statistics</div>
+            <div class="chart-box">
+                <canvas id="equityChart" height="180"></canvas>
+            </div>
+        </div>
     </div>
 
-    <button onclick="window.Telegram.WebApp.close()">Закрыть панель</button>
+    <!-- JOURNAL VIEW -->
+    <div id="journal-view" class="view content">
+        <button class="btn-back" onclick="openView('main-view')">← Назад</button>
+        <h1>Торговый Дневник</h1>
+
+        <div class="form-group">
+            <input type="text" id="symbol" placeholder="Инструмент (например BTCUSDT)">
+            <select id="result">
+                <option value="WIN">WIN (+% или +R)</option>
+                <option value="LOSS">LOSS (-% или -R)</option>
+            </select>
+            <input type="number" id="pnl" placeholder="Изменение % (например 2 или -1)" step="0.1">
+            <button onclick="addTrade()">Добавить сделку</button>
+        </div>
+
+        <div class="section-title">История Сделок</div>
+        <div id="trades-list"></div>
+    </div>
+
+    <!-- RULES VIEW -->
+    <div id="rules-view" class="view content">
+        <button class="btn-back" onclick="openView('main-view')">← Назад</button>
+        <h1>Торговые Правила</h1>
+        <div class="chart-box" style="line-height: 1.6; font-size: 14px; color: #d1d5db;">
+            <p>1. <b>Контекст:</b> Ищем 4H Sweep перед входом.</p><br>
+            <p>2. <b>Триггер:</b> Вход строго по 15M FVG / CHoCH.</p><br>
+            <p>3. <b>Риск:</b> Максимум 1% на сделку.</p><br>
+            <p>4. <b>Дисциплина:</b> Не более 2 убыточных сделок в день.</p>
+        </div>
+    </div>
 
     <script>
-        let tg = window.Telegram.WebApp;
-        tg.expand();
+        let trades = JSON.parse(localStorage.getItem('my_trades')) || [
+            { symbol: 'BTCUSDT', result: 'WIN', pnl: 2, date: '01.09' },
+            { symbol: 'XAUUSD', result: 'LOSS', pnl: -1, date: '02.09' },
+            { symbol: 'EURUSD', result: 'WIN', pnl: 3, date: '03.09' },
+            { symbol: 'ETHUSDT', result: 'WIN', pnl: 1.5, date: '04.09' }
+        ];
 
-        async function updateData() {
-            try {
-                let res = await fetch('/api/status');
-                let data = await res.json();
-                let container = document.getElementById('rows');
-                container.innerHTML = '';
-                for (const [key, value] of Object.entries(data)) {
-                    if (key === 'last_update') continue;
-                    let row = document.createElement('div');
-                    row.className = 'market-row';
-                    row.innerText = value;
-                    container.appendChild(row);
-                }
-            } catch (e) {
-                console.error("Ошибка загрузки данных", e);
-            }
+        let chartInstance = null;
+
+        function openView(viewId) {
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+            document.getElementById(viewId).classList.add('active');
+            if(viewId === 'main-view') renderChart();
         }
 
-        updateData();
-        setInterval(updateData, 5000);
+        function renderTrades() {
+            const list = document.getElementById('trades-list');
+            list.innerHTML = '';
+            trades.forEach((t, index) => {
+                const item = document.createElement('div');
+                item.className = `trade-item ${t.result}`;
+                item.innerHTML = `
+                    <div>
+                        <div class="trade-title">${t.symbol}</div>
+                        <div class="trade-info">${t.date}</div>
+                    </div>
+                    <div class="pnl ${t.result}">${t.pnl > 0 ? '+' : ''}${t.pnl}%</div>
+                `;
+                list.appendChild(item);
+            });
+        }
+
+        function addTrade() {
+            const symbol = document.getElementById('symbol').value.toUpperCase();
+            const result = document.getElementById('result').value;
+            const pnl = parseFloat(document.getElementById('pnl').value);
+
+            if (!symbol || isNaN(pnl)) return alert('Заполни все поля!');
+
+            const newTrade = {
+                symbol,
+                result,
+                pnl,
+                date: new Date().toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' })
+            };
+
+            trades.push(newTrade);
+            localStorage.setItem('my_trades', JSON.stringify(trades));
+
+            document.getElementById('symbol').value = '';
+            document.getElementById('pnl').value = '';
+
+            renderTrades();
+            alert('Сделка сохранена!');
+        }
+
+        function renderChart() {
+            const ctx = document.getElementById('equityChart').getContext('2d');
+            
+            // Расчет накопительного PnL (Equity curve)
+            let currentEquity = 0;
+            const labels = ['0'];
+            const dataPoints = [0];
+
+            trades.forEach((t, i) => {
+                currentEquity += t.pnl;
+                labels.push(`${i + 1}`);
+                dataPoints.push(currentEquity);
+            });
+
+            if (chartInstance) chartInstance.destroy();
+
+            chartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Equity (%)',
+                        data: dataPoints,
+                        borderColor: '#2563eb',
+                        borderWidth: 3,
+                        tension: 0.3,
+                        pointBackgroundColor: '#2563eb',
+                        fill: true,
+                        backgroundColor: 'rgba(37, 99, 235, 0.1)'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { grid: { color: '#232730' }, ticks: { color: '#6c757d' } },
+                        y: { grid: { color: '#232730' }, ticks: { color: '#6c757d', callback: v => v + '%' } }
+                    }
+                }
+            });
+        }
+
+        // Инициализация
+        renderTrades();
+        renderChart();
     </script>
 </body>
 </html>
-"""
-
 
 @app.route('/')
 def home():
