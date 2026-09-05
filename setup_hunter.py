@@ -9,7 +9,7 @@ import mplfinance as mpf
 import yfinance as yf
 import ccxt
 from datetime import datetime, timezone
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
 
