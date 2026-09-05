@@ -792,7 +792,7 @@ def build_alert_keyboard(instrument_key: str) -> dict:
         "inline_keyboard": [
             [
                 {"text": "📈 Открыть в TradingView", "url": tv},
-                {"text": "⚙️ Настройки", "callback_data": "setup_back"},
+                {"text": "⚙️ Настройки сетапа", "callback_data": "stratcfg:smc_sweep_fvg"},
             ]
         ]
     }
@@ -962,17 +962,50 @@ def build_strategies_keyboard(chat_id):
     return {"inline_keyboard": rows}
 
 
+SMC_SETUP_TEXT = (
+    "● <b>4H Trigger + 15M FVG</b>\n\n"
+    "Multi-timeframe setup · 4H-триггер, подтверждённый 15M-имбалансом\n\n"
+    "<b>Что это:</b>\n"
+    "Следит за 4H-триггерами и присылает алерт, когда после триггера появляется свежий 15M Fair Value Gap в том же направлении.\n\n"
+    "<b>Как это работает:</b>\n"
+    "• Бычий 4H-триггер → бычий 15M FVG → лонг\n"
+    "• Медвежий 4H-триггер → медвежий 15M FVG → шорт\n\n"
+    "<b>Режимы:</b>\n"
+    "• Sweep — после 4H Liquidity Sweep\n"
+    "• FVG — после касания 4H Fair Value Gap\n\n"
+    "<b>Важно:</b>\n"
+    "Это алерт сетапа. Торгуйте только когда общий рыночный контекст поддерживает сетап."
+)
+
+
 def build_smc_cfg_keyboard(chat_id):
     s = get_user_settings(chat_id)
-    sweep_mark = "✅" if s["smc_trigger_sweep"] else "⬜"
-    fvg_mark = "✅" if s["smc_trigger_fvg"] else "⬜"
+    enabled = "smc_sweep_fvg" in s.get("enabled_strategies", [])
+    sweep_mark = "✅" if s.get("smc_trigger_sweep", True) else "⬜"
+    fvg_mark = "✅" if s.get("smc_trigger_fvg", True) else "⬜"
+    notify_mark = "✅" if s.get("notify_always") else "⬜"
+    n_pairs = len(s.get("symbols", []))
+
     rows = [
         [
-            {"text": f"{sweep_mark} Sweep (4H)", "callback_data": "smctrig:sweep"},
-            {"text": f"{fvg_mark} FVG (4H)", "callback_data": "smctrig:fvg"},
+            {"text": "📋 Пример", "callback_data": "smc_example"},
+            {"text": f"{notify_mark} Уведомлять всегда", "callback_data": "toggle_notify_always"},
         ],
-        [{"text": "< К стратегиям", "callback_data": "goto_strategies"}],
+        [{"text": "Триггер", "callback_data": "noop"}],
+        [
+            {"text": f"{sweep_mark} Sweep", "callback_data": "smctrig:sweep"},
+            {"text": f"{fvg_mark} FVG", "callback_data": "smctrig:fvg"},
+        ],
+        [
+            {"text": f"● Мои пары ({n_pairs})", "callback_data": "instr_categories"},
+            {"text": "○ Свой список", "callback_data": "instr_categories"},
+        ],
     ]
+    if enabled:
+        rows.append([{"text": "❌ Выключить сетап", "callback_data": "strat:smc_sweep_fvg"}])
+    else:
+        rows.append([{"text": "✅ Включить сетап", "callback_data": "strat:smc_sweep_fvg"}])
+    rows.append([{"text": "< Назад", "callback_data": "goto_strategies"}])
     return {"inline_keyboard": rows}
 
 
@@ -1115,10 +1148,6 @@ def handle_callback(callback_query):
             reply_markup=build_strategies_keyboard(chat_id),
         )
         answer_callback_query(callback_id)
-    elif data == "toggle_notify_always":
-        toggle_bool_setting(chat_id, "notify_always")
-        edit_message_reply_markup(chat_id, message_id, build_global_setup_keyboard(chat_id))
-        answer_callback_query(callback_id)
     elif data == "toggle_scanning":
         toggle_bool_setting(chat_id, "scanning_enabled")
         edit_message_reply_markup(chat_id, message_id, build_global_setup_keyboard(chat_id))
@@ -1126,7 +1155,13 @@ def handle_callback(callback_query):
     elif data.startswith("strat:"):
         sid = data.split(":", 1)[1]
         toggle_strategy(chat_id, sid)
-        edit_message_reply_markup(chat_id, message_id, build_strategies_keyboard(chat_id))
+        # Если нажали из панели SMC — обновляем её, иначе список стратегий
+        try:
+            edit_message_text(
+                chat_id, message_id, SMC_SETUP_TEXT, reply_markup=build_smc_cfg_keyboard(chat_id)
+            )
+        except Exception:
+            edit_message_reply_markup(chat_id, message_id, build_strategies_keyboard(chat_id))
         answer_callback_query(callback_id)
     elif data.startswith("stratcfg:"):
         sid = data.split(":", 1)[1]
@@ -1134,7 +1169,7 @@ def handle_callback(callback_query):
             edit_message_text(
                 chat_id,
                 message_id,
-                "Настройка триггеров SMC-сетапа:",
+                SMC_SETUP_TEXT,
                 reply_markup=build_smc_cfg_keyboard(chat_id),
             )
         answer_callback_query(callback_id)
@@ -1143,6 +1178,18 @@ def handle_callback(callback_query):
         key = "smc_trigger_sweep" if which == "sweep" else "smc_trigger_fvg"
         toggle_bool_setting(chat_id, key)
         edit_message_reply_markup(chat_id, message_id, build_smc_cfg_keyboard(chat_id))
+        answer_callback_query(callback_id)
+    elif data == "smc_example":
+        answer_callback_query(callback_id, text="Пример алерта — смотри /example", show_alert=True)
+    elif data == "noop":
+        answer_callback_query(callback_id)
+    elif data == "toggle_notify_always":
+        # уже есть выше, но если пришли из SMC-панели — обновим её
+        toggle_bool_setting(chat_id, "notify_always")
+        try:
+            edit_message_reply_markup(chat_id, message_id, build_smc_cfg_keyboard(chat_id))
+        except Exception:
+            edit_message_reply_markup(chat_id, message_id, build_global_setup_keyboard(chat_id))
         answer_callback_query(callback_id)
     elif data == "instr_categories":
         edit_message_text(
