@@ -30,6 +30,16 @@ CHAT_ID = os.environ.get("CHAT_ID")
 SCREENER_TOPIC_ID = os.environ.get("SCREENER_TOPIC_ID")
 SCREENER_TOPIC_ID = int(SCREENER_TOPIC_ID) if SCREENER_TOPIC_ID else None
 
+# Остальные ветки группы — пока не используются кодом, но ID уже можно
+# сохранить в Environment на Render (NEWS_TOPIC_ID, JOURNAL_TOPIC_ID,
+# AI_TOPIC_ID), чтобы не искать их заново, когда дойдём до реализации.
+NEWS_TOPIC_ID = os.environ.get("NEWS_TOPIC_ID")
+NEWS_TOPIC_ID = int(NEWS_TOPIC_ID) if NEWS_TOPIC_ID else None
+JOURNAL_TOPIC_ID = os.environ.get("JOURNAL_TOPIC_ID")
+JOURNAL_TOPIC_ID = int(JOURNAL_TOPIC_ID) if JOURNAL_TOPIC_ID else None
+AI_TOPIC_ID = os.environ.get("AI_TOPIC_ID")
+AI_TOPIC_ID = int(AI_TOPIC_ID) if AI_TOPIC_ID else None
+
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError(
         "Не заданы переменные окружения BOT_TOKEN и/или CHAT_ID. "
