@@ -224,11 +224,36 @@ DEFAULT_SETTINGS = {
     "notify_always": False,
     "scanning_enabled": True,
     "ai_model": "gemini",  # gemini | claude | grok
+    # --- Риск / депозит / prop ---
+    "account_type": "personal",  # personal | prop
+    "balance": 0.0,              # размер депозита / prop
+    "risk_pct": 1.0,             # % риска на сделку
+    "prop_daily_loss_pct": 5.0,  # макс. дневной убыток %
+    "prop_max_loss_pct": 10.0,   # макс. общий drawdown %
+    "prop_phase": "challenge",   # challenge | funded
 }
 
 # API keys for AI models (env)
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
 GROK_API_KEY = os.environ.get("GROK_API_KEY") or os.environ.get("XAI_API_KEY")
+
+# Приблизительная стоимость 1 пункта / pip для расчёта лота (USD)
+# Для крипты: $ на 1 USDT движения цены на 1 монету
+PIP_VALUE_HINTS = {
+    # forex standard lot ≈ $10 per pip for XXXUSD
+    "FX_EURUSD": 10.0,
+    "FX_GBPUSD": 10.0,
+    "FX_USDJPY": 9.0,
+    "FX_AUDUSD": 10.0,
+    "FX_USDCAD": 9.0,
+    "FX_USDCHF": 10.0,
+    "FX_NZDUSD": 10.0,
+    "MT_XAUUSD_GCF": 1.0,   # gold: ~$1 per 0.01 move per 0.01 lot roughly — упрощённо
+    "EQ_US100": 1.0,
+    "CR_BTC": 1.0,   # $1 на $1 движения × размер позиции в монетах
+    "CR_ETH": 1.0,
+    "CR_SOL": 1.0,
+}
 
 
 # =========================================================================
@@ -314,6 +339,161 @@ def toggle_symbol(chat_id: str, symbol_key: str) -> dict:
     else:
         symbols.add(symbol_key)
     return save_user_settings(chat_id, symbols=list(symbols))
+
+
+# =========================================================================
+# РИСК / ЛОТ / PROP
+# =========================================================================
+def calc_position_size(
+    balance: float,
+    risk_pct: float,
+    entry: float,
+    stop_loss: float,
+    instrument_key: str = "",
+    account_type: str = "personal",
+    prop_daily_loss_pct: float = 5.0,
+    prop_max_loss_pct: float = 10.0,
+) -> dict:
+    """
+    Считает безопасный размер позиции.
+    Возвращает dict с lot/coins, risk_usd, max_safe_risk и т.д.
+    """
+    result = {
+        "ok": False,
+        "risk_usd": 0.0,
+        "sl_distance": 0.0,
+        "size": 0.0,          # лот (forex) или кол-во монет (crypto)
+        "size_label": "лот",
+        "max_daily_loss_usd": 0.0,
+        "max_total_loss_usd": 0.0,
+        "note": "",
+    }
+    if balance <= 0 or risk_pct <= 0 or entry <= 0:
+        result["note"] = "Задай депозит и риск % через /risk"
+        return result
+
+    sl_dist = abs(entry - stop_loss)
+    if sl_dist <= 0:
+        result["note"] = "SL должен отличаться от цены входа"
+        return result
+
+    risk_usd = balance * (risk_pct / 100.0)
+
+    # Prop: не превышать дневной лимит риска на одну сделку
+    if account_type == "prop":
+        max_daily = balance * (prop_daily_loss_pct / 100.0)
+        max_total = balance * (prop_max_loss_pct / 100.0)
+        result["max_daily_loss_usd"] = max_daily
+        result["max_total_loss_usd"] = max_total
+        # На одну сделку — не больше 20–30% от дневного лимита (консервативно)
+        cap = max_daily * 0.25
+        if risk_usd > cap:
+            risk_usd = cap
+            result["note"] = f"Риск урезан до 25% дневного лимита prop (${cap:.2f})"
+
+    kind = AVAILABLE_INSTRUMENTS.get(instrument_key, {}).get("kind", "")
+    label = AVAILABLE_INSTRUMENTS.get(instrument_key, {}).get("label", instrument_key)
+
+    if kind in ("crypto", "crypto_perp") or instrument_key.startswith("CR_"):
+        # size в монетах: risk / |entry - sl|
+        size = risk_usd / sl_dist
+        result.update({
+            "ok": True,
+            "risk_usd": round(risk_usd, 2),
+            "sl_distance": round(sl_dist, 6),
+            "size": round(size, 6),
+            "size_label": "монет",
+            "notional": round(size * entry, 2),
+        })
+        if not result["note"]:
+            result["note"] = f"{label}: размер позиции ≈ {size:.4f} монет (~${size * entry:.0f})"
+    else:
+        # Forex / metals — упрощённый расчёт стандартных лотов
+        # pip size
+        if "JPY" in label.upper():
+            pip = 0.01
+        elif "XAU" in label.upper() or "GOLD" in label.upper():
+            pip = 0.1  # упрощённо
+        else:
+            pip = 0.0001
+        pips = sl_dist / pip
+        pip_value_per_lot = PIP_VALUE_HINTS.get(instrument_key, 10.0)
+        if pips <= 0:
+            result["note"] = "Нулевая дистанция SL"
+            return result
+        lots = risk_usd / (pips * pip_value_per_lot)
+        # округление до 0.01 лота
+        lots = max(0.01, round(lots, 2))
+        result.update({
+            "ok": True,
+            "risk_usd": round(risk_usd, 2),
+            "sl_distance": round(sl_dist, 6),
+            "size": lots,
+            "size_label": "лот",
+            "pips": round(pips, 1),
+        })
+        if not result["note"]:
+            result["note"] = f"{label}: ≈ {lots} лот(а), {pips:.0f} пп до SL"
+
+    return result
+
+
+def format_risk_card(settings: dict) -> str:
+    bal = float(settings.get("balance") or 0)
+    risk = float(settings.get("risk_pct") or 1)
+    at = settings.get("account_type", "personal")
+    lines = [
+        "💰 <b>Риск-профиль</b>\n",
+        f"Тип: <b>{'Prop-счёт' if at == 'prop' else 'Личный депозит'}</b>",
+        f"Баланс / Prop: <code>${bal:,.2f}</code>",
+        f"Риск на сделку: <code>{risk}%</code> → <code>${bal * risk / 100:,.2f}</code>",
+    ]
+    if at == "prop":
+        d = float(settings.get("prop_daily_loss_pct") or 5)
+        m = float(settings.get("prop_max_loss_pct") or 10)
+        phase = settings.get("prop_phase", "challenge")
+        lines += [
+            f"Фаза prop: <b>{phase}</b>",
+            f"Дневной лимит убытка: <code>{d}%</code> (${bal * d / 100:,.2f})",
+            f"Макс. просадка: <code>{m}%</code> (${bal * m / 100:,.2f})",
+            f"Безопасный риск/сделку (≤25% дневного): <code>${bal * d / 100 * 0.25:,.2f}</code>",
+        ]
+    lines.append(
+        "\nКоманды:\n"
+        "<code>/deposit 10000</code> — баланс\n"
+        "<code>/riskpct 1</code> — % риска\n"
+        "<code>/prop 50000 5 10</code> — prop: размер, daily%, max%\n"
+        "<code>/personal</code> — обычный депозит\n"
+        "<code>/lot SYMBOL entry SL</code> — посчитать лот\n"
+        "Пример: <code>/lot BTC 104000 101500</code>"
+    )
+    return "\n".join(lines)
+
+
+def format_lot_result(calc: dict, entry: float, sl: float, direction: str = "") -> str:
+    if not calc.get("ok"):
+        return f"⚠️ {calc.get('note') or 'Не удалось посчитать'}"
+    dir_s = f" ({direction})" if direction else ""
+    lines = [
+        f"📐 <b>Расчёт позиции{dir_s}</b>\n",
+        f"Вход: <code>{entry}</code>",
+        f"SL: <code>{sl}</code>  (дист. {calc['sl_distance']})",
+        f"Риск $: <code>{calc['risk_usd']}</code>",
+        f"Размер: <b>{calc['size']}</b> {calc['size_label']}",
+    ]
+    if "notional" in calc:
+        lines.append(f"Номинал ≈ <code>${calc['notional']}</code>")
+    if "pips" in calc:
+        lines.append(f"До SL: ≈ {calc['pips']} пп")
+    if calc.get("max_daily_loss_usd"):
+        lines.append(
+            f"Prop daily limit: ${calc['max_daily_loss_usd']:.0f} | "
+            f"max DD: ${calc['max_total_loss_usd']:.0f}"
+        )
+    if calc.get("note"):
+        lines.append(f"\n<i>{calc['note']}</i>")
+    lines.append("\n⚠️ Это ориентир, не фин. совет. Проверь контракт спецификации брокера.")
+    return "\n".join(lines)
 
 
 def toggle_bool_setting(chat_id: str, key: str) -> dict:
@@ -1256,7 +1436,8 @@ def handle_command(chat_id, text, thread_id=None):
             "/example — пример алерта\n"
             "/testalert — искусственный алерт (тест UI + AI + кнопки)\n"
             "/news — новости Forex Factory на сегодня\n"
-            "/news high — только High + Medium impact\n"
+            "/risk — риск-профиль / депозит / prop\n"
+            "/lot SYMBOL entry SL — рассчитать лот\n"
             "/whereami — показать chat_id и thread_id этой темы\n\n"
             f"<i>Активная крипто-биржа: {_active_exchange_id}</i>",
             message_thread_id=thread_id,
@@ -1291,6 +1472,103 @@ def handle_command(chat_id, text, thread_id=None):
         )
     elif text == "/example":
         send_message(chat_id, EXAMPLE_TEXT, message_thread_id=thread_id)
+    elif text in ("/risk", "/deposit", "/riskprofile"):
+        s = get_user_settings(chat_id)
+        send_message(chat_id, format_risk_card(s), message_thread_id=thread_id)
+    elif text.startswith("/deposit "):
+        try:
+            bal = float(text.split(None, 1)[1].replace(",", "").replace("$", ""))
+            save_user_settings(chat_id, balance=bal, account_type="personal")
+            s = get_user_settings(chat_id)
+            send_message(chat_id, f"✅ Депозит: <b>${bal:,.2f}</b>\n\n" + format_risk_card(s), message_thread_id=thread_id)
+        except Exception:
+            send_message(chat_id, "Формат: <code>/deposit 10000</code>", message_thread_id=thread_id)
+    elif text.startswith("/riskpct "):
+        try:
+            pct = float(text.split(None, 1)[1].replace("%", "").replace(",", "."))
+            if pct <= 0 or pct > 10:
+                raise ValueError("range")
+            save_user_settings(chat_id, risk_pct=pct)
+            s = get_user_settings(chat_id)
+            send_message(chat_id, f"✅ Риск на сделку: <b>{pct}%</b>\n\n" + format_risk_card(s), message_thread_id=thread_id)
+        except Exception:
+            send_message(chat_id, "Формат: <code>/riskpct 1</code> (0.1–10%)", message_thread_id=thread_id)
+    elif text.startswith("/prop"):
+        # /prop 50000 5 10  — size, daily%, max%
+        parts = text.split()
+        try:
+            if len(parts) < 2:
+                raise ValueError("need size")
+            bal = float(parts[1].replace(",", "").replace("$", ""))
+            daily = float(parts[2]) if len(parts) > 2 else 5.0
+            maxl = float(parts[3]) if len(parts) > 3 else 10.0
+            save_user_settings(
+                chat_id,
+                account_type="prop",
+                balance=bal,
+                prop_daily_loss_pct=daily,
+                prop_max_loss_pct=maxl,
+            )
+            # авто-риск: не больше 1% или 25% дневного
+            s = get_user_settings(chat_id)
+            safe_pct = min(float(s.get("risk_pct") or 1), daily * 0.25)
+            save_user_settings(chat_id, risk_pct=round(safe_pct, 2))
+            s = get_user_settings(chat_id)
+            send_message(chat_id, f"✅ Prop-счёт настроен\n\n" + format_risk_card(s), message_thread_id=thread_id)
+        except Exception:
+            send_message(
+                chat_id,
+                "Формат: <code>/prop 50000 5 10</code>\n"
+                "размер prop · дневной лимит % · макс. просадка %",
+                message_thread_id=thread_id,
+            )
+    elif text == "/personal":
+        save_user_settings(chat_id, account_type="personal")
+        s = get_user_settings(chat_id)
+        send_message(chat_id, "✅ Режим: личный депозит\n\n" + format_risk_card(s), message_thread_id=thread_id)
+    elif text.startswith("/lot "):
+        # /lot BTC 104000 101500  или /lot EURUSD 1.0850 1.0800
+        parts = text.split()
+        try:
+            if len(parts) < 4:
+                raise ValueError("args")
+            sym_raw = parts[1].upper().replace("/", "")
+            entry = float(parts[2])
+            sl = float(parts[3])
+            # найти instrument_key
+            ikey = None
+            for k, info in AVAILABLE_INSTRUMENTS.items():
+                lab = info["label"].upper().replace("/", "").replace("_", "")
+                if sym_raw in lab or sym_raw in k:
+                    ikey = k
+                    break
+            if not ikey:
+                # попробуем CR_
+                for k in AVAILABLE_INSTRUMENTS:
+                    if sym_raw in k:
+                        ikey = k
+                        break
+            s = get_user_settings(chat_id)
+            calc = calc_position_size(
+                balance=float(s.get("balance") or 0),
+                risk_pct=float(s.get("risk_pct") or 1),
+                entry=entry,
+                stop_loss=sl,
+                instrument_key=ikey or "",
+                account_type=s.get("account_type", "personal"),
+                prop_daily_loss_pct=float(s.get("prop_daily_loss_pct") or 5),
+                prop_max_loss_pct=float(s.get("prop_max_loss_pct") or 10),
+            )
+            direction = "Лонг" if entry > sl else "Шорт"
+            send_message(chat_id, format_lot_result(calc, entry, sl, direction), message_thread_id=thread_id)
+        except Exception:
+            send_message(
+                chat_id,
+                "Формат: <code>/lot SYMBOL entry SL</code>\n"
+                "Пример: <code>/lot BTC 104000 101500</code>\n"
+                "Сначала задай депозит: <code>/deposit 10000</code>",
+                message_thread_id=thread_id,
+            )
     elif text.startswith("/news"):
         only_high = "high" in text.lower()
         send_message(chat_id, "⏳ Загружаю календарь Forex Factory…", message_thread_id=thread_id)
@@ -1848,12 +2126,39 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
 
             ai_hint = get_ai_tp_sl(label, direction, trigger, last_close, atr)
             dir_label = "Лонг-сетап" if direction == "Лонг" else "Шорт-сетап"
+
+            # Авто-лот если юзер задал депозит
+            risk_line = ""
+            try:
+                bal = float(settings.get("balance") or 0)
+                if bal > 0 and atr and atr > 0:
+                    sl_px = last_close - 1.5 * atr if direction == "Лонг" else last_close + 1.5 * atr
+                    calc = calc_position_size(
+                        balance=bal,
+                        risk_pct=float(settings.get("risk_pct") or 1),
+                        entry=last_close,
+                        stop_loss=sl_px,
+                        instrument_key=symbol_key,
+                        account_type=settings.get("account_type", "personal"),
+                        prop_daily_loss_pct=float(settings.get("prop_daily_loss_pct") or 5),
+                        prop_max_loss_pct=float(settings.get("prop_max_loss_pct") or 10),
+                    )
+                    if calc.get("ok"):
+                        risk_line = (
+                            f"\n💰 Риск: ${calc['risk_usd']} → "
+                            f"<b>{calc['size']}</b> {calc['size_label']} "
+                            f"(SL≈<code>{sl_px:.5g}</code>)"
+                        )
+            except Exception:
+                pass
+
             caption = (
                 f"● <b>{label}</b> · {strat['label']}\n"
                 f"<b>{dir_label} сформирован</b>\n"
                 f"Триггер: {trigger}\n"
                 f"Время алерта: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
-                f"Цена: <code>{last_close:.5g}</code>\n\n"
+                f"Цена: <code>{last_close:.5g}</code>"
+                f"{risk_line}\n\n"
                 f"{ai_hint}"
             )
 
