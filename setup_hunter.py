@@ -37,9 +37,26 @@ DB_PATH = os.environ.get("ALERTS_DB_PATH", "bot_state.db")
 PAGE_SIZE = 8
 TOP_CRYPTO_N = 50
 
-binance_spot = ccxt.binance()
-binance_futures = ccxt.binanceusdm()
+# Binance.com блокирует запросы с IP облачных провайдеров из США (код 451,
+# "restricted location") — а именно там хостится Render. Поэтому биржа для
+# крипто-данных вынесена в переменную окружения: если выбранная тоже
+# окажется заблокирована с твоего сервера, можно переключиться без
+# изменения кода — просто поменяй CRYPTO_EXCHANGE_ID на Render и передеплой.
+# Bybit исторически доступен с большинства облачных IP, но это стоит
+# проверить по логам после первого деплоя.
+CRYPTO_EXCHANGE_ID = os.environ.get("CRYPTO_EXCHANGE_ID", "bybit")
+
+
+def _make_exchange(market_type):
+    exchange_class = getattr(ccxt, CRYPTO_EXCHANGE_ID)
+    return exchange_class({'enableRateLimit': True, 'options': {'defaultType': market_type}})
+
+
+crypto_spot = _make_exchange('spot')
+crypto_perp = _make_exchange('swap')
 _perp_symbol_cache = {}
+
+print(f"Крипто-биржа: {CRYPTO_EXCHANGE_ID} (переключается через env CRYPTO_EXCHANGE_ID)")
 
 market_data = {"last_update": "Только что"}
 
@@ -58,7 +75,7 @@ FX_INSTRUMENTS = {
 
 MT_INSTRUMENTS = {
     'MT_XAUUSD_GCF':   {'label': 'XAU/USD (COMEX фьючерс)', 'kind': 'forex',       'ticker': 'GC=F'},
-    'MT_XAUUSDT_PERP': {'label': 'XAU/USDT (Binance перп)', 'kind': 'crypto_perp', 'ticker': 'XAUUSDT'},
+    'MT_XAUUSDT_PERP': {'label': 'XAU/USDT (перп)', 'kind': 'crypto_perp', 'ticker': 'XAUUSDT'},
     'MT_XAGUSD_SIF':   {'label': 'XAG/USD (COMEX фьючерс, серебро)', 'kind': 'forex', 'ticker': 'SI=F'},
 }
 
@@ -86,13 +103,13 @@ NQ_INSTRUMENTS = {
 
 
 def build_crypto_universe(n=TOP_CRYPTO_N):
-    """Топ-N пар к USDT на Binance по реальному 24ч объёму — считается на старте,
+    """Топ-N пар к USDT на выбранной бирже по реальному 24ч объёму — считается на старте,
     а не хардкодится, потому что ранжирование крипты по капитализации/объёму
     меняется слишком быстро, чтобы зашивать статический список в код."""
     must_include = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
     try:
-        markets = binance_spot.load_markets()
-        tickers = binance_spot.fetch_tickers()
+        markets = crypto_spot.load_markets()
+        tickers = crypto_spot.fetch_tickers()
         pairs = []
         for symbol, m in markets.items():
             if m.get('quote') == 'USDT' and m.get('spot') and m.get('active', True):
@@ -111,7 +128,7 @@ def build_crypto_universe(n=TOP_CRYPTO_N):
             universe[f'CR_{base}'] = {'label': symbol, 'kind': 'crypto', 'ticker': symbol}
         return universe
     except Exception as e:
-        print(f"Не удалось получить топ крипты с Binance, использую фиксированный набор: {e}")
+        print(f"Не удалось получить топ крипты с биржи, использую фиксированный набор: {e}")
         fallback = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'ADA/USDT', 'DOGE/USDT']
         return {f'CR_{s.split("/")[0]}': {'label': s, 'kind': 'crypto', 'ticker': s} for s in fallback}
 
@@ -123,7 +140,7 @@ AVAILABLE_INSTRUMENTS = {**FX_INSTRUMENTS, **MT_INSTRUMENTS, **CR_INSTRUMENTS, *
 INSTRUMENT_CATEGORIES = {
     'fx': {'title': 'Форекс (мажоры)', 'items': FX_INSTRUMENTS},
     'mt': {'title': 'Металлы', 'items': MT_INSTRUMENTS},
-    'cr': {'title': f'Крипто (топ {len(CR_INSTRUMENTS)} по объёму Binance)', 'items': CR_INSTRUMENTS},
+    'cr': {'title': f'Крипто (топ {len(CR_INSTRUMENTS)} по объёму, {CRYPTO_EXCHANGE_ID})', 'items': CR_INSTRUMENTS},
     'nq': {'title': 'NASDAQ (популярные)', 'items': NQ_INSTRUMENTS},
 }
 
@@ -533,7 +550,7 @@ def get_yfinance_data(ticker_symbol, timeframe):
 
 def get_crypto_spot_data(symbol, timeframe):
     tf_map = {'15M': '15m', '4H': '4h'}
-    ohlcv = binance_spot.fetch_ohlcv(symbol, tf_map[timeframe], limit=100)
+    ohlcv = crypto_spot.fetch_ohlcv(symbol, tf_map[timeframe], limit=100)
     df = pd.DataFrame(ohlcv, columns=['time', 'Open', 'High', 'Low', 'Close', 'Volume'])
     df['time'] = pd.to_datetime(df['time'], unit='ms')
     df.set_index('time', inplace=True)
@@ -543,7 +560,7 @@ def get_crypto_spot_data(symbol, timeframe):
 def resolve_perp_symbol(preferred_ticker):
     if preferred_ticker in _perp_symbol_cache:
         return _perp_symbol_cache[preferred_ticker]
-    markets = binance_futures.load_markets()
+    markets = crypto_perp.load_markets()
     candidates = [preferred_ticker, f"{preferred_ticker[:3]}/{preferred_ticker[3:]}:USDT"]
     for c in candidates:
         if c in markets:
@@ -554,13 +571,13 @@ def resolve_perp_symbol(preferred_ticker):
     if fallback:
         _perp_symbol_cache[preferred_ticker] = fallback[0]
         return fallback[0]
-    raise RuntimeError(f"Не найден символ '{preferred_ticker}' на Binance Futures")
+    raise RuntimeError(f"Не найден символ '{preferred_ticker}' на выбранной бирже (perp/swap)")
 
 
 def get_crypto_perp_data(preferred_ticker, timeframe):
     tf_map = {'15M': '15m', '4H': '4h'}
     symbol = resolve_perp_symbol(preferred_ticker)
-    ohlcv = binance_futures.fetch_ohlcv(symbol, tf_map[timeframe], limit=100)
+    ohlcv = crypto_perp.fetch_ohlcv(symbol, tf_map[timeframe], limit=100)
     df = pd.DataFrame(ohlcv, columns=['time', 'Open', 'High', 'Low', 'Close', 'Volume'])
     df['time'] = pd.to_datetime(df['time'], unit='ms')
     df.set_index('time', inplace=True)
