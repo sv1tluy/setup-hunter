@@ -518,6 +518,65 @@ def format_lot_result(calc: dict, entry: float, sl: float, direction: str = "") 
     return "\n".join(lines)
 
 
+def build_alert_risk_block(
+    settings: dict,
+    symbol_key: str,
+    direction: str,
+    entry: float,
+    atr: float = None,
+    sl_override: float = None,
+) -> str:
+    """
+    Блок лота для алерта по профилю юзера.
+    SL: sl_override или entry ± 1.5 ATR.
+    """
+    bal = float(settings.get("balance") or 0)
+    if bal <= 0:
+        return (
+            "\n💰 <i>Лот не посчитан — задай депозит:</i> "
+            "<code>/deposit 10000</code> · <code>/riskpct 1</code>"
+        )
+
+    if atr is None or atr <= 0:
+        atr = entry * 0.01
+
+    if sl_override is not None:
+        sl_px = float(sl_override)
+    elif direction == "Лонг":
+        sl_px = entry - 1.5 * atr
+    else:
+        sl_px = entry + 1.5 * atr
+
+    calc = calc_position_size(
+        balance=bal,
+        risk_pct=float(settings.get("risk_pct") or 1),
+        entry=entry,
+        stop_loss=sl_px,
+        instrument_key=symbol_key,
+        account_type=settings.get("account_type", "personal"),
+        prop_daily_loss_pct=float(settings.get("prop_daily_loss_pct") or 5),
+        prop_max_loss_pct=float(settings.get("prop_max_loss_pct") or 10),
+    )
+    if not calc.get("ok"):
+        return f"\n💰 <i>{calc.get('note') or 'не удалось посчитать лот'}</i>"
+
+    at = settings.get("account_type", "personal")
+    risk_pct = float(settings.get("risk_pct") or 1)
+    extra = ""
+    if "notional" in calc:
+        extra = f" · номинал ~${calc['notional']:,.0f}"
+    elif "pips" in calc:
+        extra = f" · ~{calc['pips']:.0f} пп"
+
+    prop_tag = " · prop" if at == "prop" else ""
+    return (
+        f"\n💰 <b>Лот по профилю</b> ({risk_pct}% / ${bal:,.0f}{prop_tag})\n"
+        f"SL ≈ <code>{sl_px:.5g}</code> → "
+        f"<b>{calc['size']}</b> {calc['size_label']} "
+        f"(риск ${calc['risk_usd']}{extra})"
+    )
+
+
 def toggle_bool_setting(chat_id: str, key: str) -> dict:
     settings = get_user_settings(chat_id)
     return save_user_settings(chat_id, **{key: not settings[key]})
@@ -1680,12 +1739,18 @@ def handle_command(chat_id, text, thread_id=None):
                 imgs.append(img_5m)
 
             ai_hint = get_ai_tp_sl(label, "Лонг", "FVG (тест)", last_close, atr)
+            # Профиль риска: сначала настройки чата, иначе групповые (CHAT_ID)
+            s = get_user_settings(chat_id)
+            if not float(s.get("balance") or 0):
+                s = get_user_settings(str(CHAT_ID))
+            risk_block = build_alert_risk_block(s, symbol_key, "Лонг", last_close, atr)
             caption = (
                 f"● <b>{label}</b> · SMC <i>(ТЕСТ)</i>\n"
                 f"<b>Лонг-сетап сформирован</b>\n"
                 f"Триггер: FVG\n"
                 f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
-                f"Цена: <code>{last_close:.5g}</code>\n\n"
+                f"Цена: <code>{last_close:.5g}</code>"
+                f"{risk_block}\n\n"
                 f"{ai_hint}"
             )
             send_telegram_media_group(imgs, caption=caption, message_thread_id=SCREENER_TOPIC_ID)
@@ -2181,31 +2246,9 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
 
             ai_hint = get_ai_tp_sl(label, direction, trigger, last_close, atr)
             dir_label = "Лонг-сетап" if direction == "Лонг" else "Шорт-сетап"
-
-            # Авто-лот если юзер задал депозит
-            risk_line = ""
-            try:
-                bal = float(settings.get("balance") or 0)
-                if bal > 0 and atr and atr > 0:
-                    sl_px = last_close - 1.5 * atr if direction == "Лонг" else last_close + 1.5 * atr
-                    calc = calc_position_size(
-                        balance=bal,
-                        risk_pct=float(settings.get("risk_pct") or 1),
-                        entry=last_close,
-                        stop_loss=sl_px,
-                        instrument_key=symbol_key,
-                        account_type=settings.get("account_type", "personal"),
-                        prop_daily_loss_pct=float(settings.get("prop_daily_loss_pct") or 5),
-                        prop_max_loss_pct=float(settings.get("prop_max_loss_pct") or 10),
-                    )
-                    if calc.get("ok"):
-                        risk_line = (
-                            f"\n💰 Риск: ${calc['risk_usd']} → "
-                            f"<b>{calc['size']}</b> {calc['size_label']} "
-                            f"(SL≈<code>{sl_px:.5g}</code>)"
-                        )
-            except Exception:
-                pass
+            risk_block = build_alert_risk_block(
+                settings, symbol_key, direction, last_close, atr
+            )
 
             caption = (
                 f"● <b>{label}</b> · {strat['label']}\n"
@@ -2213,7 +2256,7 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
                 f"Триггер: {trigger}\n"
                 f"Время алерта: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
                 f"Цена: <code>{last_close:.5g}</code>"
-                f"{risk_line}\n\n"
+                f"{risk_block}\n\n"
                 f"{ai_hint}"
             )
 
