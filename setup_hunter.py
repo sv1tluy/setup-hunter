@@ -786,60 +786,129 @@ def tradingview_url(instrument_key: str) -> str:
 
 
 def build_alert_keyboard(instrument_key: str) -> dict:
-    """Синие кнопки как в примере."""
+    """Кнопки в одну линию — как синие ссылки в примере."""
     tv = tradingview_url(instrument_key)
     return {
         "inline_keyboard": [
             [
-                {"text": "📈 Открыть в TradingView", "url": tv},
-                {"text": "⚙️ Настройки сетапа", "callback_data": "stratcfg:smc_sweep_fvg"},
+                {"text": "Открыть в TradingView", "url": tv},
+                {"text": "Настройки сетапа", "callback_data": "open_smc_settings"},
             ]
         ]
     }
 
 
 # =========================================================================
-# TELEGRAM
+# TELEGRAM + CHARTS
 # =========================================================================
+def _style_candles(ax, df):
+    """Свечи в стиле Setup Hunter: белые / серо-синие на почти чёрном фоне."""
+    from matplotlib.patches import Rectangle
+
+    UP = "#E8E8E8"       # почти белый (бычья)
+    DOWN = "#5B6B7A"     # серо-синий (медвежья)
+    WICK_UP = "#C8C8C8"
+    WICK_DOWN = "#4A5560"
+    BG = "#0B0E14"       # почти чёрный
+    GRID = "#161B22"
+    SPINE = "#1C2128"
+    TICK = "#6B7280"
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
+        is_up = c >= o
+        body_color = UP if is_up else DOWN
+        wick_color = WICK_UP if is_up else WICK_DOWN
+        ax.plot([i, i], [l, h], color=wick_color, linewidth=1.0, solid_capstyle="round", zorder=2)
+        body_bottom = min(o, c)
+        body_h = abs(c - o)
+        if body_h < (h - l) * 0.015:
+            body_h = max((h - l) * 0.015, 1e-12)
+        ax.add_patch(
+            Rectangle(
+                (i - 0.32, body_bottom), 0.64, body_h,
+                facecolor=body_color, edgecolor=body_color, linewidth=0, zorder=3,
+            )
+        )
+    ax.set_xlim(-1, len(df))
+    ax.set_facecolor(BG)
+    ax.tick_params(colors=TICK, labelsize=7)
+    for spine in ax.spines.values():
+        spine.set_color(SPINE)
+    ax.yaxis.tick_right()
+    ax.grid(True, color=GRID, linewidth=0.4, alpha=0.8)
+
+
+def _draw_zone(ax, df, top, bottom, color="#8A7A55", alpha=0.40):
+    """Зона FVG — приглушённый коричнево-бежевый как в примере."""
+    if top is None or bottom is None:
+        return
+    y0, y1 = min(float(top), float(bottom)), max(float(top), float(bottom))
+    ax.axhspan(y0, y1, facecolor=color, alpha=alpha, zorder=1, edgecolor="none")
+
+
+def render_setup_chart(df_4h, df_15m, label: str, filename: str, zone_4h=None, zone_15m=None):
+    """
+    Multi-panel как в Setup Hunter:
+      сверху большой 4H, снизу два маленьких (1H-подобный + 15M).
+    zone_* = (top, bottom) или None.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    # Ресемплим 15m → ~1H для среднего панели
+    df_1h = None
+    if df_15m is not None and len(df_15m) >= 20:
+        try:
+            df_1h = (
+                df_15m.resample("1h")
+                .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+                .dropna()
+            )
+        except Exception:
+            df_1h = df_15m.copy()
+
+    fig = plt.figure(figsize=(11, 9), facecolor="#0B0E14")
+    gs = GridSpec(2, 2, figure=fig, height_ratios=[2.2, 1.0], hspace=0.28, wspace=0.12)
+
+    # --- 4H (верх на всю ширину) ---
+    ax4 = fig.add_subplot(gs[0, :])
+    d4 = df_4h.tail(48) if df_4h is not None else df_15m.tail(48)
+    _style_candles(ax4, d4)
+    if zone_4h:
+        _draw_zone(ax4, d4, zone_4h[0], zone_4h[1])
+    ax4.set_title(f"{label} · H4", color="#d1d4dc", fontsize=11, loc="left", pad=6)
+    ax4.set_xticks([])
+
+    # --- H1 (низ-лево) ---
+    ax1 = fig.add_subplot(gs[1, 0])
+    d1 = (df_1h.tail(40) if df_1h is not None else df_15m.tail(40))
+    _style_candles(ax1, d1)
+    if zone_15m:
+        _draw_zone(ax1, d1, zone_15m[0], zone_15m[1])
+    ax1.set_title(f"{label} · H1", color="#d1d4dc", fontsize=9, loc="left", pad=4)
+    ax1.set_xticks([])
+
+    # --- 15M (низ-право) ---
+    ax15 = fig.add_subplot(gs[1, 1])
+    d15 = df_15m.tail(50)
+    _style_candles(ax15, d15)
+    if zone_15m:
+        _draw_zone(ax15, d15, zone_15m[0], zone_15m[1])
+    ax15.set_title(f"{label} · M15", color="#d1d4dc", fontsize=9, loc="left", pad=4)
+    ax15.set_xticks([])
+
+    fig.savefig(filename, dpi=130, bbox_inches="tight", facecolor="#0B0E14", edgecolor="none")
+    plt.close(fig)
+
+
 def render_chart(df, title, filename, max_bars=50):
-    """Чистый dark-стиль, ближе к TradingView."""
-    mc = mpf.make_marketcolors(
-        up="#26a69a",
-        down="#ef5350",
-        edge="inherit",
-        wick={"up": "#26a69a", "down": "#ef5350"},
-        volume="in",
-    )
-    style = mpf.make_mpf_style(
-        base_mpf_style="nightclouds",
-        marketcolors=mc,
-        gridcolor="#1e222d",
-        facecolor="#131722",
-        figcolor="#131722",
-        y_on_right=True,
-        rc={
-            "axes.labelcolor": "#d1d4dc",
-            "xtick.color": "#787b86",
-            "ytick.color": "#787b86",
-            "axes.edgecolor": "#2a2e39",
-            "figure.titlesize": 11,
-            "axes.titlesize": 10,
-        },
-    )
-    mpf.plot(
-        df.tail(max_bars),
-        type="candle",
-        style=style,
-        title=f"\n{title}",
-        savefig=dict(fname=filename, dpi=120, bbox_inches="tight", facecolor="#131722"),
-        volume=False,
-        figratio=(14, 7),
-        tight_layout=True,
-    )
+    """Fallback одиночный график (для совместимости)."""
+    render_setup_chart(df, df, title, filename)
 
 
 def send_photo_with_caption(photo_path, caption, reply_markup=None, message_thread_id=None):
-    """Одно фото + caption + кнопки (media group не поддерживает reply_markup)."""
+    """Одно фото + caption + кнопки."""
     data = {
         "chat_id": CHAT_ID,
         "caption": caption,
@@ -1108,14 +1177,12 @@ def handle_command(chat_id, text, thread_id=None):
     elif text == "/example":
         send_message(chat_id, EXAMPLE_TEXT, message_thread_id=thread_id)
     elif text == "/testalert":
-        # Искусственный алерт для теста UI / AI / кнопок
         try:
             symbol_key = "CR_BTC"
             label = AVAILABLE_INSTRUMENTS.get(symbol_key, {}).get("label", "BTC/USDT")
-            # Берём реальные данные если есть, иначе фейк
             df_4h, df_15m, _ = fetch_pair_data(symbol_key)
             if df_15m is None or len(df_15m) < 10:
-                send_message(chat_id, "⚠️ Нет данных по BTC для тестового графика. Попробуй позже.", message_thread_id=thread_id)
+                send_message(chat_id, "⚠️ Нет данных по BTC. Попробуй позже.", message_thread_id=thread_id)
                 return
             last_close = float(df_15m["Close"].iloc[-1])
             try:
@@ -1127,39 +1194,49 @@ def handle_command(chat_id, text, thread_id=None):
             except Exception:
                 atr = last_close * 0.01
 
-            img_4h = "test_4H.png"
-            img_15m = "test_15M.png"
-            render_chart(df_4h if df_4h is not None else df_15m, f"{label} · 4H Context", img_4h, max_bars=48)
-            render_chart(df_15m, f"{label} · TEST SMC · 15M", img_15m, max_bars=60)
+            zone_15m = zone_4h = None
+            try:
+                fvgs = find_fvg(df_15m)
+                if fvgs:
+                    zone_15m = (fvgs[-1]["top"], fvgs[-1]["bottom"])
+                if df_4h is not None:
+                    fvgs4 = find_fvg(df_4h)
+                    if fvgs4:
+                        zone_4h = (fvgs4[-1]["top"], fvgs4[-1]["bottom"])
+            except Exception:
+                pass
+
+            img_path = "test_setup.png"
+            render_setup_chart(
+                df_4h if df_4h is not None else df_15m,
+                df_15m,
+                label,
+                img_path,
+                zone_4h=zone_4h,
+                zone_15m=zone_15m,
+            )
 
             ai_hint = get_ai_tp_sl(label, "Лонг", "FVG (тест)", last_close, atr)
             caption = (
-                f"🎯 <b>{label}</b> <i>(ТЕСТ)</i>\n"
-                f"Стратегия: SMC: 4H Sweep/FVG + 15M FVG\n"
-                f"<b>Лонг сформирован</b>\n"
+                f"● <b>{label}</b> · SMC: 4H Sweep/FVG + 15M FVG <i>(ТЕСТ)</i>\n"
+                f"<b>Лонг-сетап сформирован</b>\n"
                 f"Триггер: FVG\n"
-                f"Цена: <code>{last_close:.5g}</code>\n"
-                f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n\n"
+                f"Время алерта: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+                f"Цена: <code>{last_close:.5g}</code>\n\n"
                 f"{ai_hint}"
             )
-            send_telegram_media_group(
-                [img_4h, img_15m],
-                caption=f"🎯 <b>{label}</b> · Лонг (ТЕСТ)\nТриггер: FVG",
-                message_thread_id=SCREENER_TOPIC_ID,
-            )
             send_photo_with_caption(
-                img_15m,
+                img_path,
                 caption,
                 reply_markup=build_alert_keyboard(symbol_key),
                 message_thread_id=SCREENER_TOPIC_ID,
             )
             send_message(chat_id, "✅ Тестовый алерт отправлен в тему «Скринер»", message_thread_id=thread_id)
-            for p in (img_4h, img_15m):
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+            if os.path.exists(img_path):
+                try:
+                    os.remove(img_path)
+                except Exception:
+                    pass
         except Exception as e:
             send_message(chat_id, f"❌ Ошибка теста: {e}", message_thread_id=thread_id)
             log.error(f"/testalert error: {e}\n{traceback.format_exc()}")
@@ -1220,15 +1297,15 @@ def handle_callback(callback_query):
         except Exception:
             edit_message_reply_markup(chat_id, message_id, build_strategies_keyboard(chat_id))
         answer_callback_query(callback_id)
-    elif data.startswith("stratcfg:"):
-        sid = data.split(":", 1)[1]
-        if sid == "smc_sweep_fvg":
-            edit_message_text(
-                chat_id,
-                message_id,
-                SMC_SETUP_TEXT,
-                reply_markup=build_smc_cfg_keyboard(chat_id),
-            )
+    elif data.startswith("stratcfg:") or data == "open_smc_settings":
+        # Всегда отправляем НОВОЕ сообщение — edit на фото-алерте не работает
+        thread_id = callback_query.get("message", {}).get("message_thread_id")
+        send_message(
+            chat_id,
+            SMC_SETUP_TEXT,
+            reply_markup=build_smc_cfg_keyboard(chat_id),
+            message_thread_id=thread_id,
+        )
         answer_callback_query(callback_id)
     elif data.startswith("smctrig:"):
         which = data.split(":", 1)[1]
@@ -1342,15 +1419,9 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
         trigger = result["trigger"]
         fired_statuses.append(f"🔥 {strat['label']}: {direction}")
 
-        img_4h = f"{symbol_key}_{sid}_4H.png"
-        img_15m = f"{symbol_key}_{sid}_15M.png"
+        img_path = f"{symbol_key}_{sid}_setup.png"
         try:
-            # Более чистые графики
-            render_chart(df_4h, f"{label} · 4H Context", img_4h, max_bars=48)
-            render_chart(df_15m, f"{label} · {strat['label']} · 15M", img_15m, max_bars=60)
-
             last_close = float(df_15m["Close"].iloc[-1])
-            # ATR(14) для эвристики
             try:
                 high_low = df_15m["High"] - df_15m["Low"]
                 high_close = (df_15m["High"] - df_15m["Close"].shift()).abs()
@@ -1358,29 +1429,41 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
                 tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
                 atr = float(tr.rolling(14).mean().iloc[-1])
             except Exception:
-                atr = None
+                atr = last_close * 0.008
+
+            # Зоны для подсветки (примерная оценка по последним FVG)
+            zone_15m = None
+            zone_4h = None
+            try:
+                fvgs = find_fvg(df_15m)
+                if fvgs:
+                    last_f = fvgs[-1]
+                    zone_15m = (last_f["top"], last_f["bottom"])
+                fvgs4 = find_fvg(df_4h)
+                if fvgs4:
+                    last_f4 = fvgs4[-1]
+                    zone_4h = (last_f4["top"], last_f4["bottom"])
+            except Exception:
+                pass
+
+            render_setup_chart(
+                df_4h, df_15m, label, img_path, zone_4h=zone_4h, zone_15m=zone_15m
+            )
 
             ai_hint = get_ai_tp_sl(label, direction, trigger, last_close, atr)
+            dir_label = "Лонг-сетап" if direction == "Лонг" else "Шорт-сетап"
 
             caption = (
-                f"🎯 <b>{label}</b>\n"
-                f"Стратегия: {strat['label']}\n"
-                f"<b>{direction} сформирован</b>\n"
+                f"● <b>{label}</b> · {strat['label']}\n"
+                f"<b>{dir_label} сформирован</b>\n"
                 f"Триггер: {trigger}\n"
-                f"Цена: <code>{last_close:.5g}</code>\n"
-                f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n\n"
+                f"Время алерта: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+                f"Цена: <code>{last_close:.5g}</code>\n\n"
                 f"{ai_hint}"
             )
 
-            # Сначала два графика (media group), потом одно фото с кнопками + полный текст
-            send_telegram_media_group(
-                [img_4h, img_15m],
-                caption=f"🎯 <b>{label}</b> · {direction}\nТриггер: {trigger}",
-                message_thread_id=SCREENER_TOPIC_ID,
-            )
-            # Второе сообщение с AI + кнопками
             send_photo_with_caption(
-                img_15m,
+                img_path,
                 caption,
                 reply_markup=build_alert_keyboard(symbol_key),
                 message_thread_id=SCREENER_TOPIC_ID,
@@ -1390,12 +1473,11 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
         except Exception as e:
             log.error(f"Ошибка отправки алерта {symbol_key}: {e}\n{traceback.format_exc()}")
         finally:
-            for p in (img_4h, img_15m):
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+            if os.path.exists(img_path):
+                try:
+                    os.remove(img_path)
+                except Exception:
+                    pass
 
     market_data[symbol_key] = (
         f"{label}: " + (" | ".join(fired_statuses) if fired_statuses else "ожидание сетапа")
