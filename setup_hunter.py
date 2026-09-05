@@ -253,6 +253,7 @@ DEFAULT_SETTINGS = {
     "prop_daily_loss_pct": 5.0,  # макс. дневной убыток %
     "prop_max_loss_pct": 10.0,   # макс. общий drawdown %
     "prop_phase": "challenge",   # challenge | funded
+    "max_notional_pct": 8.0,     # макс. номинал позиции % от баланса (prop ETH 200k ≈ 6 ETH)
 }
 
 # API keys for AI models (env)
@@ -430,6 +431,7 @@ def calc_position_size(
     prop_daily_loss_pct: float = 5.0,
     prop_max_loss_pct: float = 10.0,
     prop_phase: str = "challenge",
+    max_notional_pct: float = 8.0,
 ) -> dict:
     """
     Размер позиции с учётом правил prop:
@@ -501,11 +503,18 @@ def calc_position_size(
 
     if kind in ("crypto", "crypto_perp") or (instrument_key or "").startswith("CR_"):
         size = risk_usd / sl_dist
+        # Потолок номинала: нельзя открыть 40 ETH на 200k prop
+        max_notional = balance * max(0.5, float(max_notional_pct)) / 100.0
+        max_size = max_notional / entry if entry > 0 else size
+        if size > max_size:
+            size = max_size
+            risk_usd = size * sl_dist
+            result["rules_applied"].append(f"cap notional {max_notional_pct}% → {size:.4g}")
         result.update({
             "ok": True,
             "risk_usd": round(risk_usd, 2),
             "sl_distance": round(sl_dist, 6),
-            "size": round(size, 6),
+            "size": round(size, 4),
             "size_label": "монет",
             "notional": round(size * entry, 2),
         })
@@ -662,7 +671,7 @@ def toggle_strategy(chat_id: str, strategy_id: str) -> dict:
 
 
 # Минимальный интервал между алертами по одной паре+стратегии (минуты)
-ALERT_COOLDOWN_MINUTES = int(os.environ.get("ALERT_COOLDOWN_MINUTES", "45"))
+ALERT_COOLDOWN_MINUTES = int(os.environ.get("ALERT_COOLDOWN_MINUTES", "90"))
 
 
 def get_last_alert_info(alert_key: str) -> Optional[dict]:
@@ -697,15 +706,12 @@ def set_last_alert_time(alert_key: str, signal_time_str: str):
         conn.close()
 
 
-def should_skip_alert(alert_key: str, signal_time_str: str, notify_always: bool) -> bool:
+def should_skip_alert(alert_key: str, signal_time_str: str, notify_always: bool = False) -> bool:
     """
     True = не слать.
-    Правила:
-      1) тот же signal_time уже слали → skip (если не notify_always)
-      2) с прошлого алерта прошло меньше ALERT_COOLDOWN_MINUTES → skip (если не notify_always)
+    Кулдаун ВСЕГДА действует (даже если «уведомлять всегда»):
+      один алерт на пару+стратегию+направление раз в ALERT_COOLDOWN_MINUTES.
     """
-    if notify_always:
-        return False
     info = get_last_alert_info(alert_key)
     if not info:
         return False
@@ -1233,10 +1239,11 @@ def format_alert_caption(
 
 
 def format_lot_line(settings: dict, symbol_key: str, direction: str, entry: float, sl: float) -> str:
-    """Одна строка: Лот: 3.1 монет (риск $2000)."""
+    """Одна строка: Лот: 6.1 монет (риск $2000)."""
     profile = resolve_account_profile(settings)
     if not profile["ok"]:
         return "Лот: — (задайте /deposit или /prop)"
+    max_n = float(settings.get("max_notional_pct") or (8.0 if profile["account_type"] == "prop" else 20.0))
     calc = calc_position_size(
         balance=profile["balance"],
         risk_pct=profile["risk_pct"],
@@ -1247,6 +1254,7 @@ def format_lot_line(settings: dict, symbol_key: str, direction: str, entry: floa
         prop_daily_loss_pct=profile["daily_pct"],
         prop_max_loss_pct=profile["max_pct"],
         prop_phase=profile["phase"],
+        max_notional_pct=max_n,
     )
     if not calc.get("ok"):
         return f"Лот: — ({calc.get('note') or 'ошибка'})"
@@ -1780,6 +1788,21 @@ def handle_command(chat_id, text, thread_id=None):
         save_user_settings(chat_id, account_type="personal")
         s = get_user_settings(chat_id)
         send_message(chat_id, "✅ Режим: личный депозит\n\n" + format_risk_card(s), message_thread_id=thread_id)
+    elif text.startswith("/maxpos"):
+        parts = text.split()
+        try:
+            pct = float(parts[1]) if len(parts) > 1 else 8.0
+            if pct <= 0 or pct > 100:
+                raise ValueError("range")
+            save_user_settings(chat_id, max_notional_pct=pct)
+            send_message(
+                chat_id,
+                f"✅ Макс. номинал позиции: <b>{pct}%</b> от баланса.\n"
+                f"На prop $200k и ETH≈$2470 это ≈ <b>{200000 * pct / 100 / 2470:.1f} ETH</b>.",
+                message_thread_id=thread_id,
+            )
+        except Exception:
+            send_message(chat_id, "Формат: <code>/maxpos 8</code> — макс. % номинала от баланса (по умолч. 8%)", message_thread_id=thread_id)
     elif text.startswith("/lot "):
         # /lot BTC 104000 101500  или /lot EURUSD 1.0850 1.0800
         parts = text.split()
@@ -1817,6 +1840,7 @@ def handle_command(chat_id, text, thread_id=None):
                 prop_daily_loss_pct=profile["daily_pct"],
                 prop_max_loss_pct=profile["max_pct"],
                 prop_phase=profile["phase"],
+                max_notional_pct=float(s.get("max_notional_pct") or 8.0),
             )
             direction = "Лонг" if entry > sl else "Шорт"
             send_message(chat_id, format_lot_result(calc, entry, sl, direction), message_thread_id=thread_id)
@@ -1889,13 +1913,9 @@ def handle_command(chat_id, text, thread_id=None):
                 s = get_user_settings(str(CHAT_ID))
             lot_line = format_lot_line(s, symbol_key, "Лонг", last_close, levels["sl"])
             caption = format_alert_caption(label, "Лонг", "FVG", last_close, levels, lot_line, test=True)
+            tv = tradingview_url(symbol_key)
+            caption += f'\n<a href="{tv}">Открыть в TradingView</a>'
             send_telegram_media_group(imgs, caption=caption, message_thread_id=SCREENER_TOPIC_ID)
-            send_message(
-                CHAT_ID,
-                f"● <b>{label}</b> — действия:",
-                reply_markup=build_alert_keyboard(symbol_key),
-                message_thread_id=SCREENER_TOPIC_ID,
-            )
             send_message(chat_id, "✅ Тестовый алерт отправлен в тему «Скринер»", message_thread_id=thread_id)
             for p in imgs:
                 if os.path.exists(p):
@@ -2332,14 +2352,13 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
         if result is None:
             continue
 
-        alert_key = f"{symbol_key}:{sid}"
-        signal_time_str = result["time"].isoformat()
-        if should_skip_alert(alert_key, signal_time_str, settings.get("notify_always", False)):
-            fired_statuses.append(f"{strat['label']}: кулдаун / уже отправлено")
-            continue
-
         direction = result["direction"]
         trigger = result["trigger"]
+        alert_key = f"{symbol_key}:{sid}:{direction}"
+        signal_time_str = result["time"].isoformat()
+        if should_skip_alert(alert_key, signal_time_str):
+            fired_statuses.append(f"{strat['label']}: кулдаун / уже отправлено")
+            continue
         fired_statuses.append(f"🔥 {strat['label']}: {direction}")
 
         imgs = []
@@ -2385,16 +2404,12 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
             caption = format_alert_caption(
                 label, direction, trigger, last_close, levels, lot_line, test=False
             )
+            tv = tradingview_url(symbol_key)
+            caption += f'\n<a href="{tv}">Открыть в TradingView</a>'
 
             send_telegram_media_group(
                 imgs,
                 caption=caption,
-                message_thread_id=SCREENER_TOPIC_ID,
-            )
-            send_message(
-                CHAT_ID,
-                f"● <b>{label}</b> — действия:",
-                reply_markup=build_alert_keyboard(symbol_key),
                 message_thread_id=SCREENER_TOPIC_ID,
             )
             set_last_alert_time(alert_key, signal_time_str)
