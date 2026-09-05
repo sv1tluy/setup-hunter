@@ -928,3 +928,20 @@ threading.Thread(target=run_telegram_polling, daemon=True).start()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+    # ПРАВИЛЬНО:
+
+@app.route('/journal')
+def journal():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            .cover { height: 140px; background: url('https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop') center/cover no-repeat; position: relative; }
+        </style>
+    </head>
+    <body>
+        ...
+    </body>
+    </html>
+    """
