@@ -17,8 +17,8 @@ app = Flask(__name__)
 # Токен и chat_id теперь берутся ТОЛЬКО из переменных окружения.
 # Никогда не хардкодь их в файле — если файл когда-нибудь попадёт в git/чат/лог,
 # токен будет считаться скомпрометированным.
-BOT_TOKEN = os.environ.get("8773030425:AAGNwPdc3NK9h2LmP-R-9ny9UgaTMilMJR0")
-CHAT_ID = os.environ.get("8707344733")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError(
