@@ -326,14 +326,26 @@ def toggle_strategy(chat_id: str, strategy_id: str) -> dict:
     return save_user_settings(chat_id, enabled_strategies=list(enabled))
 
 
-def get_last_alert_time(alert_key: str) -> Optional[str]:
+# Минимальный интервал между алертами по одной паре+стратегии (минуты)
+ALERT_COOLDOWN_MINUTES = int(os.environ.get("ALERT_COOLDOWN_MINUTES", "45"))
+
+
+def get_last_alert_info(alert_key: str) -> Optional[dict]:
+    """Возвращает {signal_time, sent_at} или None."""
     with db_lock:
         conn = _get_conn()
         row = conn.execute(
-            "SELECT signal_time FROM sent_alerts WHERE alert_key = ?", (alert_key,)
+            "SELECT signal_time, sent_at FROM sent_alerts WHERE alert_key = ?", (alert_key,)
         ).fetchone()
         conn.close()
-    return row[0] if row else None
+    if not row:
+        return None
+    return {"signal_time": row[0], "sent_at": row[1]}
+
+
+def get_last_alert_time(alert_key: str) -> Optional[str]:
+    info = get_last_alert_info(alert_key)
+    return info["signal_time"] if info else None
 
 
 def set_last_alert_time(alert_key: str, signal_time_str: str):
@@ -348,6 +360,32 @@ def set_last_alert_time(alert_key: str, signal_time_str: str):
         )
         conn.commit()
         conn.close()
+
+
+def should_skip_alert(alert_key: str, signal_time_str: str, notify_always: bool) -> bool:
+    """
+    True = не слать.
+    Правила:
+      1) тот же signal_time уже слали → skip (если не notify_always)
+      2) с прошлого алерта прошло меньше ALERT_COOLDOWN_MINUTES → skip (если не notify_always)
+    """
+    if notify_always:
+        return False
+    info = get_last_alert_info(alert_key)
+    if not info:
+        return False
+    if info["signal_time"] == signal_time_str:
+        return True
+    try:
+        sent_at = datetime.fromisoformat(info["sent_at"])
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - sent_at).total_seconds() / 60.0
+        if elapsed < ALERT_COOLDOWN_MINUTES:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def get_update_offset() -> int:
@@ -1142,6 +1180,8 @@ def handle_command(chat_id, text, thread_id=None):
             "/status — текущие настройки\n"
             "/example — пример алерта\n"
             "/testalert — искусственный алерт (тест UI + AI + кнопки)\n"
+            "/news — новости Forex Factory на сегодня\n"
+            "/news high — только High + Medium impact\n"
             "/whereami — показать chat_id и thread_id этой темы\n\n"
             f"<i>Активная крипто-биржа: {_active_exchange_id}</i>",
             message_thread_id=thread_id,
@@ -1176,6 +1216,18 @@ def handle_command(chat_id, text, thread_id=None):
         )
     elif text == "/example":
         send_message(chat_id, EXAMPLE_TEXT, message_thread_id=thread_id)
+    elif text.startswith("/news"):
+        only_high = "high" in text.lower()
+        send_message(chat_id, "⏳ Загружаю календарь Forex Factory…", message_thread_id=thread_id)
+        try:
+            events = fetch_forexfactory_events()
+            text_out = format_news_list(events, only_high=only_high)
+            # шлём и в текущую тему, и дублируем в NEWS_TOPIC если это не она
+            send_message(chat_id, text_out, message_thread_id=thread_id)
+            if thread_id != NEWS_TOPIC_ID:
+                send_message(CHAT_ID, text_out, message_thread_id=NEWS_TOPIC_ID)
+        except Exception as e:
+            send_message(chat_id, f"❌ Ошибка загрузки новостей: {e}", message_thread_id=thread_id)
     elif text == "/testalert":
         try:
             symbol_key = "CR_BTC"
@@ -1410,9 +1462,8 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
 
         alert_key = f"{symbol_key}:{sid}"
         signal_time_str = result["time"].isoformat()
-        already_sent = get_last_alert_time(alert_key) == signal_time_str
-        if already_sent and not settings["notify_always"]:
-            fired_statuses.append(f"{strat['label']}: уже отправлено")
+        if should_skip_alert(alert_key, signal_time_str, settings.get("notify_always", False)):
+            fired_statuses.append(f"{strat['label']}: кулдаун / уже отправлено")
             continue
 
         direction = result["direction"]
@@ -1540,6 +1591,220 @@ def run_scanner_background():
 
 
 # =========================================================================
+# НОВОСТИ — Forex Factory
+# =========================================================================
+NEWS_CHECK_INTERVAL = int(os.environ.get("NEWS_CHECK_INTERVAL", "120"))  # секунд
+NEWS_ALERT_MINUTES = [15, 5, 0]  # за сколько минут предупреждать
+_news_sent_keys = set()  # in-memory: event_id+offset уже слали
+
+
+def _ff_day_url(dt: datetime = None) -> str:
+    dt = dt or datetime.now(timezone.utc)
+    # Forex Factory day format: sep5.2026
+    return f"https://www.forexfactory.com/calendar?day={dt.strftime('%b%d.%Y').lower()}"
+
+
+def fetch_forexfactory_events(for_date: datetime = None) -> List[dict]:
+    """
+    Парсит календарь FF на день.
+    Возвращает список:
+      {title, currency, impact, time_str, datetime_utc, forecast, previous, actual}
+    impact: high / medium / low / holiday / unknown
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        log.error("beautifulsoup4 не установлен")
+        return []
+
+    url = _ff_day_url(for_date)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            log.warning(f"FF calendar HTTP {resp.status_code}")
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as e:
+        log.warning(f"FF fetch error: {e}")
+        return []
+
+    events = []
+    rows = soup.select("tr.calendar__row") or soup.select("table.calendar__table tr")
+    current_date = (for_date or datetime.now(timezone.utc)).date()
+    last_time = None
+
+    impact_map = {
+        "high": "high",
+        "red": "high",
+        "medium": "medium",
+        "orange": "medium",
+        "low": "low",
+        "yellow": "low",
+        "holiday": "holiday",
+        "gray": "holiday",
+        "grey": "holiday",
+    }
+
+    for row in rows:
+        try:
+            # impact
+            impact_cell = row.select_one("td.calendar__impact") or row.select_one(".calendar__impact")
+            impact = "unknown"
+            if impact_cell:
+                span = impact_cell.select_one("span")
+                classes = " ".join((span.get("class") if span else []) or impact_cell.get("class") or [])
+                classes_l = classes.lower()
+                for k, v in impact_map.items():
+                    if k in classes_l:
+                        impact = v
+                        break
+                # icon title fallback
+                title_attr = (span.get("title") if span else None) or impact_cell.get("title") or ""
+                tl = title_attr.lower()
+                if "high" in tl:
+                    impact = "high"
+                elif "medium" in tl:
+                    impact = "medium"
+                elif "low" in tl:
+                    impact = "low"
+
+            currency_el = row.select_one("td.calendar__currency") or row.select_one(".calendar__currency")
+            currency = (currency_el.get_text(strip=True) if currency_el else "") or ""
+
+            event_el = row.select_one("td.calendar__event") or row.select_one(".calendar__event-title")
+            title = (event_el.get_text(strip=True) if event_el else "") or ""
+            if not title:
+                continue
+
+            time_el = row.select_one("td.calendar__time") or row.select_one(".calendar__time")
+            time_str = (time_el.get_text(strip=True) if time_el else "") or last_time or ""
+            if time_str:
+                last_time = time_str
+
+            def _cell(cls):
+                el = row.select_one(f"td.calendar__{cls}") or row.select_one(f".calendar__{cls}")
+                return el.get_text(strip=True) if el else ""
+
+            actual = _cell("actual")
+            forecast = _cell("forecast")
+            previous = _cell("previous")
+
+            # Парсим время → UTC (FF обычно America/New_York)
+            event_dt = None
+            try:
+                if time_str and ":" in time_str and "day" not in time_str.lower():
+                    # e.g. "8:30am" or "14:30"
+                    t = time_str.lower().replace(" ", "")
+                    fmt = "%I:%M%p" if ("am" in t or "pm" in t) else "%H:%M"
+                    parsed = datetime.strptime(t, fmt)
+                    if NY_TZ is not None:
+                        event_dt = datetime(
+                            current_date.year, current_date.month, current_date.day,
+                            parsed.hour, parsed.minute, tzinfo=NY_TZ,
+                        ).astimezone(timezone.utc)
+                    else:
+                        # грубо NY ≈ UTC-4/-5
+                        event_dt = datetime(
+                            current_date.year, current_date.month, current_date.day,
+                            parsed.hour, parsed.minute, tzinfo=timezone.utc,
+                        ) + timedelta(hours=4)
+            except Exception:
+                event_dt = None
+
+            events.append({
+                "title": title,
+                "currency": currency,
+                "impact": impact,
+                "time_str": time_str,
+                "datetime_utc": event_dt,
+                "forecast": forecast,
+                "previous": previous,
+                "actual": actual,
+            })
+        except Exception:
+            continue
+
+    log.info(f"FF calendar: {len(events)} events for {current_date}")
+    return events
+
+
+def format_news_list(events: List[dict], only_high: bool = False) -> str:
+    if only_high:
+        events = [e for e in events if e["impact"] in ("high", "medium")]
+    if not events:
+        return "На сегодня важных новостей не найдено (или FF недоступен)."
+
+    impact_emoji = {"high": "🔴", "medium": "🟠", "low": "🟡", "holiday": "⚪", "unknown": "•"}
+    lines = [f"📅 <b>Новости на сегодня</b> ({len(events)})\n"]
+    for e in events:
+        em = impact_emoji.get(e["impact"], "•")
+        t = e["time_str"] or "—"
+        cur = e["currency"] or ""
+        title = e["title"]
+        extra = []
+        if e.get("forecast"):
+            extra.append(f"F: {e['forecast']}")
+        if e.get("previous"):
+            extra.append(f"P: {e['previous']}")
+        extra_s = f"  <i>({' | '.join(extra)})</i>" if extra else ""
+        lines.append(f"{em} <b>{t}</b> {cur} — {title}{extra_s}")
+    lines.append("\n🔴 High  🟠 Medium  🟡 Low")
+    return "\n".join(lines)
+
+
+def check_upcoming_news_alerts():
+    """Фон: шлёт в тему Новости за 15/5/0 мин до high/medium."""
+    events = fetch_forexfactory_events()
+    now = datetime.now(timezone.utc)
+    for e in events:
+        if e["impact"] not in ("high", "medium"):
+            continue
+        if e["datetime_utc"] is None:
+            continue
+        delta_min = (e["datetime_utc"] - now).total_seconds() / 60.0
+        for offset in NEWS_ALERT_MINUTES:
+            # окно ±1.5 мин вокруг точки
+            if abs(delta_min - offset) <= 1.5:
+                key = f"{e['title']}|{e['datetime_utc'].isoformat()}|{offset}"
+                if key in _news_sent_keys:
+                    continue
+                _news_sent_keys.add(key)
+                em = "🔴" if e["impact"] == "high" else "🟠"
+                if offset == 0:
+                    when = "СЕЙЧАС"
+                else:
+                    when = f"через {offset} мин"
+                text = (
+                    f"{em} <b>Новость {when}</b>\n\n"
+                    f"<b>{e['currency']}</b> {e['title']}\n"
+                    f"Время: {e['time_str']} (NY)\n"
+                    f"Impact: {e['impact'].upper()}\n"
+                )
+                if e.get("forecast") or e.get("previous"):
+                    text += f"Forecast: {e.get('forecast') or '—'} | Previous: {e.get('previous') or '—'}\n"
+                send_message(CHAT_ID, text, message_thread_id=NEWS_TOPIC_ID)
+                log.info(f"News alert: {e['title']} ({when})")
+
+
+def run_news_background():
+    time.sleep(8)
+    log.info("News monitor started")
+    while True:
+        try:
+            check_upcoming_news_alerts()
+        except Exception as e:
+            log.error(f"News monitor error: {e}")
+        time.sleep(NEWS_CHECK_INTERVAL)
+
+
+# =========================================================================
 # FLASK
 # =========================================================================
 @app.route("/api/status")
@@ -1562,6 +1827,7 @@ log.info(f"Крипто-биржа: {_active_exchange_id}, инструмент�
 
 threading.Thread(target=run_scanner_background, daemon=True).start()
 threading.Thread(target=run_telegram_polling, daemon=True).start()
+threading.Thread(target=run_news_background, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
