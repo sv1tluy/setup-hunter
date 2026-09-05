@@ -50,6 +50,7 @@ app = Flask(__name__)
 # =========================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID", "-1003970795061")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # задай в Render Environment
 
 # Жёстко прописанные thread_id из /whereami (можно переопределить env)
 SCREENER_TOPIC_ID = int(os.environ.get("SCREENER_TOPIC_ID", "2"))
@@ -709,22 +710,148 @@ def fetch_pair_data(instrument_key: str):
 
 
 # =========================================================================
+# AI (Gemini) — TP/SL подсказки
+# =========================================================================
+def get_ai_tp_sl(label: str, direction: str, trigger: str, last_close: float, atr: float = None) -> str:
+    """Короткая подсказка TP/SL для новичка. Если нет ключа — fallback-эвристика."""
+    if not GEMINI_API_KEY:
+        # Простая эвристика без AI
+        if atr and atr > 0:
+            if direction == "Лонг":
+                sl = last_close - 1.5 * atr
+                tp1 = last_close + 2.0 * atr
+                tp2 = last_close + 3.5 * atr
+            else:
+                sl = last_close + 1.5 * atr
+                tp1 = last_close - 2.0 * atr
+                tp2 = last_close - 3.5 * atr
+            return (
+                f"📍 <b>Подсказка (эвристика):</b>\n"
+                f"SL ≈ <code>{sl:.5g}</code>\n"
+                f"TP1 ≈ <code>{tp1:.5g}</code>  |  TP2 ≈ <code>{tp2:.5g}</code>\n"
+                f"<i>Риск 1 : 1.3–2.3. Ставь SL за ближайший свинг.</i>"
+            )
+        return "📍 <i>Укажи GEMINI_API_KEY для умных TP/SL</i>"
+
+    try:
+        from google import genai
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = (
+            f"Ты опытный трейдер. Инструмент: {label}. "
+            f"Сигнал: {direction}. Триггер: {trigger}. "
+            f"Текущая цена ≈ {last_close}. "
+            f"Дай очень короткий ответ на русском (макс 4 строки) для новичка:\n"
+            f"1) Куда примерно поставить Stop Loss\n"
+            f"2) Take Profit 1 и Take Profit 2\n"
+            f"3) Одно предложение риска/RR.\n"
+            f"Без воды, только практика. Используй HTML-теги <b> и <code> если нужно."
+        )
+        resp = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt,
+        )
+        text = (resp.text or "").strip()
+        if text:
+            return f"🤖 <b>AI подсказка:</b>\n{text}"
+    except Exception as e:
+        log.warning(f"Gemini TP/SL error: {e}")
+    return "📍 <i>AI временно недоступен</i>"
+
+
+def tradingview_url(instrument_key: str) -> str:
+    """Ссылка на TradingView для инструмента."""
+    info = AVAILABLE_INSTRUMENTS.get(instrument_key, {})
+    kind = info.get("kind", "")
+    ticker = info.get("ticker", "")
+    label = info.get("label", "")
+
+    if kind == "crypto":
+        # BTC/USDT → BINANCE:BTCUSDT (самый популярный)
+        base = ticker.replace("/", "")
+        return f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}"
+    if kind == "crypto_perp":
+        base = ticker.replace("USDT", "USDT")
+        return f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}.P"
+    if kind == "forex":
+        # EURUSD=X → FX:EURUSD
+        sym = ticker.replace("=X", "").replace("=F", "")
+        if "GC" in ticker:
+            return "https://www.tradingview.com/chart/?symbol=COMEX:GC1!"
+        if "SI" in ticker:
+            return "https://www.tradingview.com/chart/?symbol=COMEX:SI1!"
+        return f"https://www.tradingview.com/chart/?symbol=FX:{sym}"
+    if kind == "equity":
+        return f"https://www.tradingview.com/chart/?symbol=NASDAQ:{ticker}"
+    return "https://www.tradingview.com/"
+
+
+def build_alert_keyboard(instrument_key: str) -> dict:
+    """Синие кнопки как в примере."""
+    tv = tradingview_url(instrument_key)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📈 Открыть в TradingView", "url": tv},
+                {"text": "⚙️ Настройки", "callback_data": "setup_back"},
+            ]
+        ]
+    }
+
+
+# =========================================================================
 # TELEGRAM
 # =========================================================================
-def render_chart(df, title, filename):
-    mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="in")
+def render_chart(df, title, filename, max_bars=50):
+    """Чистый dark-стиль, ближе к TradingView."""
+    mc = mpf.make_marketcolors(
+        up="#26a69a",
+        down="#ef5350",
+        edge="inherit",
+        wick={"up": "#26a69a", "down": "#ef5350"},
+        volume="in",
+    )
     style = mpf.make_mpf_style(
-        base_mpf_style="nightclouds", marketcolors=mc, gridcolor="#2a2e39", facecolor="#131722"
+        base_mpf_style="nightclouds",
+        marketcolors=mc,
+        gridcolor="#1e222d",
+        facecolor="#131722",
+        figcolor="#131722",
+        y_on_right=True,
+        rc={
+            "axes.labelcolor": "#d1d4dc",
+            "xtick.color": "#787b86",
+            "ytick.color": "#787b86",
+            "axes.edgecolor": "#2a2e39",
+            "figure.titlesize": 11,
+            "axes.titlesize": 10,
+        },
     )
     mpf.plot(
-        df.tail(40),
+        df.tail(max_bars),
         type="candle",
         style=style,
         title=f"\n{title}",
-        savefig=filename,
+        savefig=dict(fname=filename, dpi=120, bbox_inches="tight", facecolor="#131722"),
         volume=False,
-        figratio=(12, 7),
+        figratio=(14, 7),
+        tight_layout=True,
     )
+
+
+def send_photo_with_caption(photo_path, caption, reply_markup=None, message_thread_id=None):
+    """Одно фото + caption + кнопки (media group не поддерживает reply_markup)."""
+    data = {
+        "chat_id": CHAT_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if message_thread_id is not None:
+        data["message_thread_id"] = str(message_thread_id)
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup)
+    with open(photo_path, "rb") as f:
+        files = {"photo": f}
+        return tg_post("sendPhoto", files=files, data=data)
 
 
 def tg_post(method, payload=None, files=None, data=None):
@@ -1114,24 +1241,50 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
         img_4h = f"{symbol_key}_{sid}_4H.png"
         img_15m = f"{symbol_key}_{sid}_15M.png"
         try:
-            render_chart(df_4h, f"{label} · 4H Context", img_4h)
-            render_chart(df_15m, f"{label} · {strat['label']}", img_15m)
+            # Более чистые графики
+            render_chart(df_4h, f"{label} · 4H Context", img_4h, max_bars=48)
+            render_chart(df_15m, f"{label} · {strat['label']} · 15M", img_15m, max_bars=60)
+
+            last_close = float(df_15m["Close"].iloc[-1])
+            # ATR(14) для эвристики
+            try:
+                high_low = df_15m["High"] - df_15m["Low"]
+                high_close = (df_15m["High"] - df_15m["Close"].shift()).abs()
+                low_close = (df_15m["Low"] - df_15m["Close"].shift()).abs()
+                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                atr = float(tr.rolling(14).mean().iloc[-1])
+            except Exception:
+                atr = None
+
+            ai_hint = get_ai_tp_sl(label, direction, trigger, last_close, atr)
 
             caption = (
                 f"🎯 <b>{label}</b>\n"
                 f"Стратегия: {strat['label']}\n"
                 f"<b>{direction} сформирован</b>\n"
                 f"Триггер: {trigger}\n"
-                f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
-                f"<i>биржа: {_active_exchange_id}</i>"
+                f"Цена: <code>{last_close:.5g}</code>\n"
+                f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n\n"
+                f"{ai_hint}"
             )
+
+            # Сначала два графика (media group), потом одно фото с кнопками + полный текст
             send_telegram_media_group(
-                [img_4h, img_15m], caption, message_thread_id=SCREENER_TOPIC_ID
+                [img_4h, img_15m],
+                caption=f"🎯 <b>{label}</b> · {direction}\nТриггер: {trigger}",
+                message_thread_id=SCREENER_TOPIC_ID,
+            )
+            # Второе сообщение с AI + кнопками
+            send_photo_with_caption(
+                img_15m,
+                caption,
+                reply_markup=build_alert_keyboard(symbol_key),
+                message_thread_id=SCREENER_TOPIC_ID,
             )
             set_last_alert_time(alert_key, signal_time_str)
             log.info(f"✅ Алерт по {symbol_key} ({sid}) отправлен в тему {SCREENER_TOPIC_ID}")
         except Exception as e:
-            log.error(f"Ошибка отправки алерта {symbol_key}: {e}")
+            log.error(f"Ошибка отправки алерта {symbol_key}: {e}\n{traceback.format_exc()}")
         finally:
             for p in (img_4h, img_15m):
                 if os.path.exists(p):
