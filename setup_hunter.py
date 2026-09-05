@@ -223,7 +223,12 @@ DEFAULT_SETTINGS = {
     "smc_trigger_fvg": True,
     "notify_always": False,
     "scanning_enabled": True,
+    "ai_model": "gemini",  # gemini | claude | grok
 }
+
+# API keys for AI models (env)
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+GROK_API_KEY = os.environ.get("GROK_API_KEY") or os.environ.get("XAI_API_KEY")
 
 
 # =========================================================================
@@ -643,8 +648,13 @@ def is_us_equity_market_open() -> bool:
 
 
 def get_yfinance_data(ticker_symbol: str, timeframe: str):
-    interval = "15m" if timeframe == "15M" else "60m"
-    period = "5d" if timeframe == "15M" else "1mo"
+    # 5M / 15M — короткий период; 4H — из 60m
+    if timeframe == "5M":
+        interval, period = "5m", "5d"
+    elif timeframe == "15M":
+        interval, period = "15m", "5d"
+    else:
+        interval, period = "60m", "1mo"
     try:
         df = yf.download(tickers=ticker_symbol, period=period, interval=interval, progress=False, auto_adjust=True)
     except Exception as e:
@@ -669,7 +679,9 @@ def get_yfinance_data(ticker_symbol: str, timeframe: str):
 def get_crypto_spot_data(symbol: str, timeframe: str):
     if crypto_spot is None:
         return None
-    tf_map = {"15M": "15m", "4H": "4h"}
+    tf_map = {"5M": "5m", "15M": "15m", "4H": "4h"}
+    if timeframe not in tf_map:
+        return None
     try:
         ohlcv = crypto_spot.fetch_ohlcv(symbol, tf_map[timeframe], limit=100)
         df = pd.DataFrame(ohlcv, columns=["time", "Open", "High", "Low", "Close", "Volume"])
@@ -707,7 +719,9 @@ def resolve_perp_symbol(preferred_ticker: str) -> str:
 def get_crypto_perp_data(preferred_ticker: str, timeframe: str):
     if crypto_perp is None:
         return None
-    tf_map = {"15M": "15m", "4H": "4h"}
+    tf_map = {"5M": "5m", "15M": "15m", "4H": "4h"}
+    if timeframe not in tf_map:
+        return None
     try:
         symbol = resolve_perp_symbol(preferred_ticker)
         ohlcv = crypto_perp.fetch_ohlcv(symbol, tf_map[timeframe], limit=100)
@@ -721,30 +735,35 @@ def get_crypto_perp_data(preferred_ticker: str, timeframe: str):
 
 
 def fetch_pair_data(instrument_key: str):
+    """Возвращает (df_4h, df_15m, df_5m, skip_reason)."""
     info = AVAILABLE_INSTRUMENTS[instrument_key]
     kind = info["kind"]
     ticker = info["ticker"]
 
     if kind == "forex":
         if not is_forex_market_open():
-            return None, None, "market_closed"
+            return None, None, None, "market_closed"
         df_4h = get_yfinance_data(ticker, "4H")
         df_15m = get_yfinance_data(ticker, "15M")
+        df_5m = get_yfinance_data(ticker, "5M")
     elif kind == "equity":
         if not is_us_equity_market_open():
-            return None, None, "market_closed"
+            return None, None, None, "market_closed"
         df_4h = get_yfinance_data(ticker, "4H")
         df_15m = get_yfinance_data(ticker, "15M")
+        df_5m = get_yfinance_data(ticker, "5M")
     elif kind == "crypto":
         df_4h = get_crypto_spot_data(ticker, "4H")
         df_15m = get_crypto_spot_data(ticker, "15M")
+        df_5m = get_crypto_spot_data(ticker, "5M")
     elif kind == "crypto_perp":
         df_4h = get_crypto_perp_data(ticker, "4H")
         df_15m = get_crypto_perp_data(ticker, "15M")
+        df_5m = get_crypto_perp_data(ticker, "5M")
     else:
-        return None, None, "unknown_kind"
+        return None, None, None, "unknown_kind"
 
-    return df_4h, df_15m, None
+    return df_4h, df_15m, df_5m, None
 
 
 # =========================================================================
@@ -940,9 +959,27 @@ def render_setup_chart(df_4h, df_15m, label: str, filename: str, zone_4h=None, z
     plt.close(fig)
 
 
+def render_single_chart(df, title: str, filename: str, max_bars: int = 60, zone=None):
+    """Один таймфрейм — отдельная картинка в стиле Setup Hunter."""
+    import matplotlib.pyplot as plt
+
+    if df is None or len(df) < 5:
+        return False
+    data = df.tail(max_bars)
+    fig, ax = plt.subplots(figsize=(11, 5.5), facecolor="#0B0E14")
+    _style_candles(ax, data)
+    if zone:
+        _draw_zone(ax, data, zone[0], zone[1])
+    ax.set_title(title, color="#d1d4dc", fontsize=12, loc="left", pad=8)
+    ax.set_xticks([])
+    fig.savefig(filename, dpi=130, bbox_inches="tight", facecolor="#0B0E14", edgecolor="none")
+    plt.close(fig)
+    return True
+
+
 def render_chart(df, title, filename, max_bars=50):
-    """Fallback одиночный график (для совместимости)."""
-    render_setup_chart(df, df, title, filename)
+    """Fallback одиночный график."""
+    render_single_chart(df, title, filename, max_bars=max_bars)
 
 
 def send_photo_with_caption(photo_path, caption, reply_markup=None, message_thread_id=None):
@@ -1232,7 +1269,7 @@ def handle_command(chat_id, text, thread_id=None):
         try:
             symbol_key = "CR_BTC"
             label = AVAILABLE_INSTRUMENTS.get(symbol_key, {}).get("label", "BTC/USDT")
-            df_4h, df_15m, _ = fetch_pair_data(symbol_key)
+            df_4h, df_15m, df_5m, _ = fetch_pair_data(symbol_key)
             if df_15m is None or len(df_15m) < 10:
                 send_message(chat_id, "⚠️ Нет данных по BTC. Попробуй позже.", message_thread_id=thread_id)
                 return
@@ -1246,7 +1283,7 @@ def handle_command(chat_id, text, thread_id=None):
             except Exception:
                 atr = last_close * 0.01
 
-            zone_15m = zone_4h = None
+            zone_15m = zone_4h = zone_5m = None
             try:
                 fvgs = find_fvg(df_15m)
                 if fvgs:
@@ -1255,40 +1292,45 @@ def handle_command(chat_id, text, thread_id=None):
                     fvgs4 = find_fvg(df_4h)
                     if fvgs4:
                         zone_4h = (fvgs4[-1]["top"], fvgs4[-1]["bottom"])
+                if df_5m is not None:
+                    fvgs5 = find_fvg(df_5m)
+                    if fvgs5:
+                        zone_5m = (fvgs5[-1]["top"], fvgs5[-1]["bottom"])
             except Exception:
                 pass
 
-            img_path = "test_setup.png"
-            render_setup_chart(
-                df_4h if df_4h is not None else df_15m,
-                df_15m,
-                label,
-                img_path,
-                zone_4h=zone_4h,
-                zone_15m=zone_15m,
-            )
+            imgs = []
+            img_4h, img_15m, img_5m = "test_4H.png", "test_15M.png", "test_5M.png"
+            render_single_chart(df_4h if df_4h is not None else df_15m, f"{label} · H4", img_4h, 48, zone_4h)
+            render_single_chart(df_15m, f"{label} · M15", img_15m, 60, zone_15m)
+            imgs = [img_4h, img_15m]
+            if df_5m is not None and len(df_5m) >= 10:
+                render_single_chart(df_5m, f"{label} · M5", img_5m, 60, zone_5m)
+                imgs.append(img_5m)
 
             ai_hint = get_ai_tp_sl(label, "Лонг", "FVG (тест)", last_close, atr)
             caption = (
-                f"● <b>{label}</b> · SMC: 4H Sweep/FVG + 15M FVG <i>(ТЕСТ)</i>\n"
+                f"● <b>{label}</b> · SMC <i>(ТЕСТ)</i>\n"
                 f"<b>Лонг-сетап сформирован</b>\n"
                 f"Триггер: FVG\n"
-                f"Время алерта: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+                f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
                 f"Цена: <code>{last_close:.5g}</code>\n\n"
                 f"{ai_hint}"
             )
-            send_photo_with_caption(
-                img_path,
-                caption,
+            send_telegram_media_group(imgs, caption=caption, message_thread_id=SCREENER_TOPIC_ID)
+            send_message(
+                CHAT_ID,
+                f"● <b>{label}</b> — действия:",
                 reply_markup=build_alert_keyboard(symbol_key),
                 message_thread_id=SCREENER_TOPIC_ID,
             )
             send_message(chat_id, "✅ Тестовый алерт отправлен в тему «Скринер»", message_thread_id=thread_id)
-            if os.path.exists(img_path):
-                try:
-                    os.remove(img_path)
-                except Exception:
-                    pass
+            for p in imgs:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
         except Exception as e:
             send_message(chat_id, f"❌ Ошибка теста: {e}", message_thread_id=thread_id)
             log.error(f"/testalert error: {e}\n{traceback.format_exc()}")
@@ -1369,6 +1411,28 @@ def handle_callback(callback_query):
         answer_callback_query(callback_id, text="Пример алерта — смотри /example", show_alert=True)
     elif data == "noop":
         answer_callback_query(callback_id)
+    elif data.startswith("aimodel:"):
+        model = data.split(":", 1)[1]
+        if model in ("gemini", "claude", "grok"):
+            save_user_settings(chat_id, ai_model=model)
+            thread_id = callback_query.get("message", {}).get("message_thread_id")
+            try:
+                edit_message_text(
+                    chat_id,
+                    message_id,
+                    f"✅ Модель ИИ: <b>{model}</b>\nПросто напиши вопрос.",
+                    reply_markup=build_ai_model_keyboard(chat_id),
+                )
+            except Exception:
+                send_message(
+                    chat_id,
+                    f"✅ Модель ИИ: <b>{model}</b>",
+                    reply_markup=build_ai_model_keyboard(chat_id),
+                    message_thread_id=thread_id,
+                )
+            answer_callback_query(callback_id, text=f"Модель: {model}")
+        else:
+            answer_callback_query(callback_id)
     elif data == "toggle_notify_always":
         # уже есть выше, но если пришли из SMC-панели — обновим её
         toggle_bool_setting(chat_id, "notify_always")
@@ -1407,6 +1471,219 @@ def handle_callback(callback_query):
         answer_callback_query(callback_id)
 
 
+# =========================================================================
+# ИИ-ХЕЛПЕР (тема 5)
+# =========================================================================
+AI_SYSTEM_PROMPT = (
+    "Ты — торговый ассистент в Telegram-группе Trading Hub. "
+    "Отвечай на русском, кратко и по делу. Помогаешь с SMC, FVG, Sweep, BOS, "
+    "риском, TP/SL, психологией трейдинга и разбором идей. "
+    "Не давай финансовых советов в юридическом смысле — это образование. "
+    "Если просят картинку — скажи использовать /img промпт."
+)
+
+
+def _chat_gemini(user_text: str) -> str:
+    if not GEMINI_API_KEY:
+        return "⚠️ GEMINI_API_KEY не задан."
+    from google import genai
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    resp = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=f"{AI_SYSTEM_PROMPT}\n\nПользователь: {user_text}",
+    )
+    return (resp.text or "").strip() or "Пустой ответ."
+
+
+def _chat_claude(user_text: str) -> str:
+    if not CLAUDE_API_KEY:
+        return "⚠️ CLAUDE_API_KEY / ANTHROPIC_API_KEY не задан."
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "system": AI_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_text}],
+        },
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        return f"❌ Claude error {resp.status_code}: {resp.text[:200]}"
+    data = resp.json()
+    parts = data.get("content") or []
+    texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
+    return "\n".join(texts).strip() or "Пустой ответ."
+
+
+def _chat_grok(user_text: str) -> str:
+    if not GROK_API_KEY:
+        return "⚠️ GROK_API_KEY / XAI_API_KEY не задан."
+    resp = requests.post(
+        "https://api.x.ai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROK_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "grok-3",
+            "messages": [
+                {"role": "system", "content": AI_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            "temperature": 0.7,
+        },
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        return f"❌ Grok error {resp.status_code}: {resp.text[:200]}"
+    data = resp.json()
+    return (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
+        or "Пустой ответ."
+    )
+
+
+def ai_chat(user_text: str, model: str = "gemini") -> str:
+    model = (model or "gemini").lower()
+    try:
+        if model == "claude":
+            return _chat_claude(user_text)
+        if model == "grok":
+            return _chat_grok(user_text)
+        return _chat_gemini(user_text)
+    except Exception as e:
+        log.error(f"AI chat ({model}) error: {e}")
+        return f"❌ Ошибка ИИ ({model}): {e}"
+
+
+def build_ai_model_keyboard(chat_id: str) -> dict:
+    s = get_user_settings(chat_id)
+    current = s.get("ai_model", "gemini")
+    models = [
+        ("gemini", "Gemini"),
+        ("claude", "Claude"),
+        ("grok", "Grok"),
+    ]
+    row = []
+    for mid, label in models:
+        mark = "✅ " if mid == current else ""
+        row.append({"text": f"{mark}{label}", "callback_data": f"aimodel:{mid}"})
+    return {"inline_keyboard": [row]}
+
+
+def gemini_image(prompt: str, out_path: str) -> bool:
+    """Генерация картинки через Gemini image model. True если файл создан."""
+    if not GEMINI_API_KEY:
+        return False
+    try:
+        from google import genai
+        from google.genai import types
+        import base64
+
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        # Пробуем актуальные image-модели по очереди
+        for model_id in ("gemini-3.1-flash-image", "gemini-2.5-flash-image"):
+            try:
+                resp = client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE", "TEXT"],
+                    ),
+                )
+                # Ищем image parts
+                for cand in getattr(resp, "candidates", []) or []:
+                    content = getattr(cand, "content", None)
+                    if not content:
+                        continue
+                    for part in getattr(content, "parts", []) or []:
+                        inline = getattr(part, "inline_data", None)
+                        if inline and getattr(inline, "data", None):
+                            data = inline.data
+                            if isinstance(data, str):
+                                data = base64.b64decode(data)
+                            with open(out_path, "wb") as f:
+                                f.write(data)
+                            return True
+            except Exception as e:
+                log.warning(f"Image model {model_id}: {e}")
+                continue
+        return False
+    except Exception as e:
+        log.error(f"gemini_image error: {e}")
+        return False
+
+
+def handle_ai_message(chat_id: str, text: str, thread_id=None):
+    text = (text or "").strip()
+    if not text:
+        return
+
+    settings = get_user_settings(chat_id)
+    model = settings.get("ai_model", "gemini")
+
+    if text.startswith("/img ") or text.startswith("/image "):
+        prompt = text.split(" ", 1)[1].strip()
+        send_message(chat_id, "🎨 Генерирую изображение (Gemini)…", message_thread_id=thread_id)
+        path = f"ai_img_{int(time.time())}.png"
+        ok = gemini_image(prompt, path)
+        if ok and os.path.exists(path):
+            send_photo_with_caption(path, f"🎨 <i>{prompt[:200]}</i>", message_thread_id=thread_id)
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        else:
+            send_message(
+                chat_id,
+                "❌ Не удалось сгенерировать картинку (лимит / модель / ключ).",
+                message_thread_id=thread_id,
+            )
+        return
+
+    if text in ("/model", "/models", "/aimodel"):
+        send_message(
+            chat_id,
+            f"🤖 Выбери модель ИИ\nТекущая: <b>{model}</b>\n\n"
+            "• <b>Gemini</b> — бесплатно (нужен GEMINI_API_KEY)\n"
+            "• <b>Claude</b> — Anthropic (CLAUDE_API_KEY)\n"
+            "• <b>Grok</b> — xAI (GROK_API_KEY / XAI_API_KEY)",
+            reply_markup=build_ai_model_keyboard(chat_id),
+            message_thread_id=thread_id,
+        )
+        return
+
+    if text in ("/ai", "/help", "/start"):
+        send_message(
+            chat_id,
+            "🤖 <b>ИИ-хелпер</b>\n\n"
+            "Просто напиши вопрос — отвечу.\n"
+            f"Модель: <b>{model}</b>  ·  <code>/model</code> — сменить\n"
+            "<code>/img описание</code> — картинка (Gemini)\n\n"
+            "Примеры:\n"
+            "• Что такое FVG простыми словами?\n"
+            "• Куда ставить SL после bullish sweep?",
+            reply_markup=build_ai_model_keyboard(chat_id),
+            message_thread_id=thread_id,
+        )
+        return
+
+    send_message(chat_id, f"⏳ {model} думает…", message_thread_id=thread_id)
+    answer = ai_chat(text, model=model)
+    if len(answer) > 4000:
+        answer = answer[:4000] + "…"
+    send_message(chat_id, answer, message_thread_id=thread_id)
+
+
 def run_telegram_polling():
     offset = get_update_offset()
     log.info("Telegram polling started")
@@ -1427,7 +1704,14 @@ def run_telegram_polling():
                 if "message" in update and "text" in update["message"]:
                     chat_id = str(update["message"]["chat"]["id"])
                     thread_id = update["message"].get("message_thread_id")
-                    handle_command(chat_id, update["message"]["text"], thread_id=thread_id)
+                    text = update["message"]["text"]
+                    # Сообщения в теме ИИ-хелпер → AI
+                    if thread_id == AI_TOPIC_ID and not text.startswith(
+                        ("/setup", "/strategies", "/instruments", "/status", "/news", "/testalert", "/whereami", "/example")
+                    ):
+                        handle_ai_message(chat_id, text, thread_id=thread_id)
+                    else:
+                        handle_command(chat_id, text, thread_id=thread_id)
                 elif "callback_query" in update:
                     handle_callback(update["callback_query"])
         except Exception as e:
@@ -1438,7 +1722,7 @@ def run_telegram_polling():
 # =========================================================================
 # СКАНИРОВАНИЕ
 # =========================================================================
-def process_pair(symbol_key, df_4h, df_15m, settings):
+def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
     label = AVAILABLE_INSTRUMENTS[symbol_key]["label"]
 
     if df_4h is None or df_15m is None or len(df_15m) < 25:
@@ -1470,7 +1754,7 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
         trigger = result["trigger"]
         fired_statuses.append(f"🔥 {strat['label']}: {direction}")
 
-        img_path = f"{symbol_key}_{sid}_setup.png"
+        imgs = []
         try:
             last_close = float(df_15m["Close"].iloc[-1])
             try:
@@ -1482,28 +1766,34 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
             except Exception:
                 atr = last_close * 0.008
 
-            # Зоны для подсветки (примерная оценка по последним FVG)
-            zone_15m = None
-            zone_4h = None
+            zone_15m = zone_4h = zone_5m = None
             try:
                 fvgs = find_fvg(df_15m)
                 if fvgs:
-                    last_f = fvgs[-1]
-                    zone_15m = (last_f["top"], last_f["bottom"])
+                    zone_15m = (fvgs[-1]["top"], fvgs[-1]["bottom"])
                 fvgs4 = find_fvg(df_4h)
                 if fvgs4:
-                    last_f4 = fvgs4[-1]
-                    zone_4h = (last_f4["top"], last_f4["bottom"])
+                    zone_4h = (fvgs4[-1]["top"], fvgs4[-1]["bottom"])
+                if df_5m is not None and len(df_5m) > 10:
+                    fvgs5 = find_fvg(df_5m)
+                    if fvgs5:
+                        zone_5m = (fvgs5[-1]["top"], fvgs5[-1]["bottom"])
             except Exception:
                 pass
 
-            render_setup_chart(
-                df_4h, df_15m, label, img_path, zone_4h=zone_4h, zone_15m=zone_15m
-            )
+            # Три отдельных графика: 4H, 15M, 5M
+            img_4h = f"{symbol_key}_{sid}_4H.png"
+            img_15m = f"{symbol_key}_{sid}_15M.png"
+            img_5m = f"{symbol_key}_{sid}_5M.png"
+            render_single_chart(df_4h, f"{label} · H4", img_4h, max_bars=48, zone=zone_4h)
+            render_single_chart(df_15m, f"{label} · M15", img_15m, max_bars=60, zone=zone_15m)
+            imgs = [img_4h, img_15m]
+            if df_5m is not None and len(df_5m) >= 10:
+                render_single_chart(df_5m, f"{label} · M5", img_5m, max_bars=60, zone=zone_5m)
+                imgs.append(img_5m)
 
             ai_hint = get_ai_tp_sl(label, direction, trigger, last_close, atr)
             dir_label = "Лонг-сетап" if direction == "Лонг" else "Шорт-сетап"
-
             caption = (
                 f"● <b>{label}</b> · {strat['label']}\n"
                 f"<b>{dir_label} сформирован</b>\n"
@@ -1513,9 +1803,15 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
                 f"{ai_hint}"
             )
 
-            send_photo_with_caption(
-                img_path,
-                caption,
+            # media group: все ТФ, caption на первом; кнопки — отдельным сообщением с последним фото
+            send_telegram_media_group(
+                imgs,
+                caption=caption,
+                message_thread_id=SCREENER_TOPIC_ID,
+            )
+            send_message(
+                CHAT_ID,
+                f"● <b>{label}</b> — действия:",
                 reply_markup=build_alert_keyboard(symbol_key),
                 message_thread_id=SCREENER_TOPIC_ID,
             )
@@ -1524,11 +1820,12 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
         except Exception as e:
             log.error(f"Ошибка отправки алерта {symbol_key}: {e}\n{traceback.format_exc()}")
         finally:
-            if os.path.exists(img_path):
-                try:
-                    os.remove(img_path)
-                except Exception:
-                    pass
+            for p in imgs:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
     market_data[symbol_key] = (
         f"{label}: " + (" | ".join(fired_statuses) if fired_statuses else "ожидание сетапа")
@@ -1559,7 +1856,7 @@ def analyze_and_notify():
         label = AVAILABLE_INSTRUMENTS[symbol_key]["label"]
         market_data[symbol_key] = f"{label}: сканирование..."
         try:
-            df_4h, df_15m, skip_reason = fetch_pair_data(symbol_key)
+            df_4h, df_15m, df_5m, skip_reason = fetch_pair_data(symbol_key)
             if skip_reason == "market_closed":
                 market_data[symbol_key] = f"{label}: рынок закрыт"
                 continue
@@ -1567,7 +1864,7 @@ def analyze_and_notify():
                 market_data[symbol_key] = f"{label}: нет данных"
                 log.warning(f"{symbol_key}: данные не получены")
                 continue
-            process_pair(symbol_key, df_4h, df_15m, settings)
+            process_pair(symbol_key, df_4h, df_15m, settings, df_5m=df_5m)
         except Exception as e:
             market_data[symbol_key] = f"{label}: ошибка ({e})"
             log.error(f"Ошибка {symbol_key}: {e}\n{traceback.format_exc()}")
