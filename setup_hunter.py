@@ -24,6 +24,11 @@ app = Flask(__name__)
 # =========================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+# ID темы (топика) в группе, куда слать алерты скринера. Если группа обычная
+# (без включённых Topics) или тема не задана — оставь пустым, алерты пойдут
+# в чат как раньше, без привязки к теме.
+SCREENER_TOPIC_ID = os.environ.get("SCREENER_TOPIC_ID")
+SCREENER_TOPIC_ID = int(SCREENER_TOPIC_ID) if SCREENER_TOPIC_ID else None
 
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError(
@@ -636,10 +641,12 @@ def tg_post(method, payload=None, files=None, data=None):
         return None
 
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, message_thread_id=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
     return tg_post("sendMessage", payload=payload)
 
 
@@ -663,7 +670,7 @@ def answer_callback_query(callback_query_id, text=None, show_alert=False):
     return tg_post("answerCallbackQuery", payload=payload)
 
 
-def send_telegram_media_group(photos, caption):
+def send_telegram_media_group(photos, caption, message_thread_id=None):
     media = []
     files = {}
     for i, photo_path in enumerate(photos):
@@ -676,6 +683,8 @@ def send_telegram_media_group(photos, caption):
         files[attach_name] = open(photo_path, "rb")
 
     data = {"chat_id": CHAT_ID, "media": json.dumps(media)}
+    if message_thread_id is not None:
+        data["message_thread_id"] = str(message_thread_id)
     try:
         tg_post("sendMediaGroup", files=files, data=data)
     finally:
@@ -779,7 +788,7 @@ EXAMPLE_TEXT = (
 # =========================================================================
 # КОМАНДЫ И КНОПКИ
 # =========================================================================
-def handle_command(chat_id, text):
+def handle_command(chat_id, text, thread_id=None):
     text = text.strip()
     if text in ("/start", "/help"):
         send_message(chat_id,
@@ -788,18 +797,20 @@ def handle_command(chat_id, text):
             "/strategies — выбрать активные стратегии\n"
             "/instruments — выбрать инструменты для наблюдения\n"
             "/status — текущие настройки\n"
-            "/example — пример алерта"
+            "/example — пример алерта",
+            message_thread_id=thread_id
         )
     elif text == "/setup":
-        send_message(chat_id, GLOBAL_SETUP_TEXT, reply_markup=build_global_setup_keyboard(chat_id))
+        send_message(chat_id, GLOBAL_SETUP_TEXT, reply_markup=build_global_setup_keyboard(chat_id),
+                      message_thread_id=thread_id)
     elif text == "/strategies":
         send_message(chat_id, "Выбери активные стратегии (можно несколько):",
-                      reply_markup=build_strategies_keyboard(chat_id))
+                      reply_markup=build_strategies_keyboard(chat_id), message_thread_id=thread_id)
     elif text == "/instruments":
         send_message(chat_id, "Выбери категорию инструментов:",
-                      reply_markup=build_category_menu_keyboard(chat_id))
+                      reply_markup=build_category_menu_keyboard(chat_id), message_thread_id=thread_id)
     elif text == "/example":
-        send_message(chat_id, EXAMPLE_TEXT)
+        send_message(chat_id, EXAMPLE_TEXT, message_thread_id=thread_id)
     elif text == "/status":
         s = get_user_settings(chat_id)
         strat_txt = "\n".join(
@@ -812,7 +823,8 @@ def handle_command(chat_id, text):
             f"<b>Сканирование:</b> {'включено 🟢' if s['scanning_enabled'] else 'выключено 🔴'}\n"
             f"<b>Уведомлять всегда:</b> {'да' if s['notify_always'] else 'нет'}\n\n"
             f"<b>Стратегии:</b>\n{strat_txt}\n\n"
-            f"<b>Инструменты ({len(s['symbols'])}):</b>\n{symbols_txt}"
+            f"<b>Инструменты ({len(s['symbols'])}):</b>\n{symbols_txt}",
+            message_thread_id=thread_id
         )
 
 
@@ -899,7 +911,8 @@ def run_telegram_polling():
                 set_update_offset(offset)
                 if "message" in update and "text" in update["message"]:
                     chat_id = str(update["message"]["chat"]["id"])
-                    handle_command(chat_id, update["message"]["text"])
+                    thread_id = update["message"].get("message_thread_id")
+                    handle_command(chat_id, update["message"]["text"], thread_id=thread_id)
                 elif "callback_query" in update:
                     handle_callback(update["callback_query"])
         except Exception as e:
@@ -955,7 +968,7 @@ def process_pair(symbol_key, df_4h, df_15m, settings):
                 f"Триггер: {trigger}\n"
                 f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
             )
-            send_telegram_media_group([img_4h, img_15m], caption)
+            send_telegram_media_group([img_4h, img_15m], caption, message_thread_id=SCREENER_TOPIC_ID)
             set_last_alert_time(alert_key, signal_time_str)
             print(f"✅ Алерт по {symbol_key} ({sid}) отправлен!")
         finally:
