@@ -637,35 +637,12 @@ def build_alert_risk_block(
     if not calc.get("ok"):
         return f"\n💰 <i>{calc.get('note') or 'не удалось посчитать лот'}</i>"
 
-    extra = ""
-    if "notional" in calc:
-        extra = f" · номинал ~${calc['notional']:,.0f}"
-    elif "pips" in calc:
-        extra = f" · ~{calc['pips']:.0f} пп"
-
-    if profile["account_type"] == "prop":
-        header = (
-            f"💰 <b>Лот (PROP {profile['phase']})</b> "
-            f"${profile['balance']:,.0f} · daily −{profile['daily_pct']}% · "
-            f"maxDD −{profile['max_pct']}%"
-        )
-        limits = (
-            f"\nЛимиты: daily ${calc['max_daily_loss_usd']:,.0f} | "
-            f"maxDD ${calc['max_total_loss_usd']:,.0f} → "
-            f"на сделку ${calc['risk_usd']} ({calc['risk_pct_used']}%)"
-        )
-    else:
-        header = (
-            f"💰 <b>Лот по депозиту</b> "
-            f"${profile['balance']:,.0f} · риск {profile['risk_pct']}%"
-        )
-        limits = f"\nРиск на сделку: ${calc['risk_usd']} ({calc['risk_pct_used']}%)"
-
+    size_s = f"{calc['size']:.4g}" if calc["size_label"] == "монет" else str(calc["size"])
+    tag = "prop" if profile["account_type"] == "prop" else "деп"
     return (
-        f"\n{header}"
-        f"{limits}\n"
-        f"SL ≈ <code>{sl_px:.5g}</code> → "
-        f"<b>{calc['size']}</b> {calc['size_label']}{extra}"
+        f"\n💰 SL <code>{sl_px:.5g}</code> · "
+        f"<b>{size_s}</b> {calc['size_label']} · "
+        f"риск ${calc['risk_usd']:.0f} ({tag})"
     )
 
 
@@ -1131,23 +1108,55 @@ GEMINI_MODELS = [
 ]
 
 
-def _atr_fallback(direction: str, last_close: float, atr: float = None) -> str:
-    if atr and atr > 0:
-        if direction == "Лонг":
-            sl = last_close - 1.5 * atr
-            tp1 = last_close + 2.0 * atr
-            tp2 = last_close + 3.5 * atr
-        else:
-            sl = last_close + 1.5 * atr
-            tp1 = last_close - 2.0 * atr
-            tp2 = last_close - 3.5 * atr
-        return (
-            f"📍 <b>Подсказка (без AI, ATR):</b>\n"
-            f"SL ≈ <code>{sl:.5g}</code>\n"
-            f"TP1 ≈ <code>{tp1:.5g}</code>  |  TP2 ≈ <code>{tp2:.5g}</code>\n"
-            f"<i>Риск ~1:1.3–2.3. SL за ближайший свинг.</i>"
-        )
-    return "📍 <i>AI недоступен, ATR нет</i>"
+def _atr_levels(direction: str, last_close: float, atr: float = None) -> dict:
+    """SL/TP1/TP2 по ATR."""
+    if not atr or atr <= 0:
+        atr = last_close * 0.01
+    if direction == "Лонг":
+        return {
+            "sl": last_close - 1.5 * atr,
+            "tp1": last_close + 2.0 * atr,
+            "tp2": last_close + 3.5 * atr,
+        }
+    return {
+        "sl": last_close + 1.5 * atr,
+        "tp1": last_close - 2.0 * atr,
+        "tp2": last_close - 3.5 * atr,
+    }
+
+
+def _parse_levels_from_text(text: str, direction: str, last_close: float, atr: float = None) -> dict:
+    """Достаёт числа SL/TP из ответа модели, иначе ATR."""
+    import re
+    levels = _atr_levels(direction, last_close, atr)
+    if not text:
+        return levels
+    # ищем паттерны SL: 79100, TP1: 80600 и т.п.
+    nums = re.findall(r"(?:SL|TP1|TP2|Stop|Take)[^\d]{0,12}([\d]+(?:[.,]\d+)?)", text, flags=re.I)
+    cleaned = []
+    for n in nums:
+        try:
+            cleaned.append(float(n.replace(",", ".").replace(" ", "")))
+        except Exception:
+            pass
+    # fallback: любые крупные числа
+    if len(cleaned) < 2:
+        all_nums = re.findall(r"\b(\d{2,7}(?:[.,]\d+)?)\b", text)
+        cleaned = []
+        for n in all_nums:
+            try:
+                v = float(n.replace(",", "."))
+                if last_close * 0.5 < v < last_close * 1.5:
+                    cleaned.append(v)
+            except Exception:
+                pass
+    if len(cleaned) >= 1:
+        levels["sl"] = cleaned[0]
+    if len(cleaned) >= 2:
+        levels["tp1"] = cleaned[1]
+    if len(cleaned) >= 3:
+        levels["tp2"] = cleaned[2]
+    return levels
 
 
 def _gemini_generate(prompt: str) -> str:
@@ -1177,33 +1186,72 @@ def _gemini_generate(prompt: str) -> str:
     raise RuntimeError(str(last_err) if last_err else "empty")
 
 
-def get_ai_tp_sl(label: str, direction: str, trigger: str, last_close: float, atr: float = None) -> str:
-    """Короткая подсказка TP/SL. При квоте Gemini — ATR-fallback."""
+def get_ai_levels(label: str, direction: str, trigger: str, last_close: float, atr: float = None) -> dict:
+    """
+    Возвращает {sl, tp1, tp2} — из AI или ATR.
+    """
+    levels = _atr_levels(direction, last_close, atr)
     if not GEMINI_API_KEY:
-        return _atr_fallback(direction, last_close, atr)
-
+        return levels
     prompt = (
-        f"Ты опытный трейдер. Инструмент: {label}. "
-        f"Сигнал: {direction}. Триггер: {trigger}. "
-        f"Текущая цена ≈ {last_close}. "
-        f"Дай очень короткий ответ на русском (макс 4 строки) для новичка:\n"
-        f"1) Куда примерно поставить Stop Loss\n"
-        f"2) Take Profit 1 и Take Profit 2\n"
-        f"3) Одно предложение риска/RR.\n"
-        f"Без воды, только практика. Используй HTML-теги <b> и <code> если нужно."
+        f"{label}, {direction}, {trigger}, цена {last_close}. "
+        f"Только 3 числа в формате:\nSL: ...\nTP1: ...\nTP2: ..."
     )
     try:
         text = _gemini_generate(prompt)
-        return f"🤖 <b>AI подсказка:</b>\n{text}"
-    except RuntimeError as e:
-        if str(e) == "quota":
-            log.warning("Gemini quota exhausted → ATR fallback")
-            return _atr_fallback(direction, last_close, atr) + "\n<i>(квота Gemini на сегодня кончилась)</i>"
-        log.warning(f"Gemini TP/SL: {e}")
-        return _atr_fallback(direction, last_close, atr)
+        return _parse_levels_from_text(text, direction, last_close, atr)
     except Exception as e:
-        log.warning(f"Gemini TP/SL error: {e}")
-        return _atr_fallback(direction, last_close, atr)
+        log.warning(f"get_ai_levels: {e}")
+        return levels
+
+
+def format_alert_caption(
+    label: str,
+    direction: str,
+    trigger: str,
+    entry: float,
+    levels: dict,
+    lot_line: str,
+    test: bool = False,
+) -> str:
+    """
+    Короткий алерт:
+      ● BTC/USDT · Лонг · FVG
+      SL … · TP1 … · TP2 …
+      Лот: …
+    """
+    dir_s = "Лонг" if direction == "Лонг" else "Шорт"
+    test_s = " <i>(тест)</i>" if test else ""
+    sl = levels.get("sl", entry)
+    tp1 = levels.get("tp1", entry)
+    tp2 = levels.get("tp2", entry)
+    return (
+        f"● <b>{label}</b> · {dir_s} · {trigger}{test_s}\n"
+        f"SL <code>{sl:.5g}</code> · TP1 <code>{tp1:.5g}</code> · TP2 <code>{tp2:.5g}</code>\n"
+        f"{lot_line}"
+    )
+
+
+def format_lot_line(settings: dict, symbol_key: str, direction: str, entry: float, sl: float) -> str:
+    """Одна строка: Лот: 3.1 монет (риск $2000)."""
+    profile = resolve_account_profile(settings)
+    if not profile["ok"]:
+        return "Лот: — (задайте /deposit или /prop)"
+    calc = calc_position_size(
+        balance=profile["balance"],
+        risk_pct=profile["risk_pct"],
+        entry=entry,
+        stop_loss=sl,
+        instrument_key=symbol_key,
+        account_type=profile["account_type"],
+        prop_daily_loss_pct=profile["daily_pct"],
+        prop_max_loss_pct=profile["max_pct"],
+        prop_phase=profile["phase"],
+    )
+    if not calc.get("ok"):
+        return f"Лот: — ({calc.get('note') or 'ошибка'})"
+    size_s = f"{calc['size']:.4g}" if calc["size_label"] == "монет" else str(calc["size"])
+    return f"Лот: <b>{size_s}</b> {calc['size_label']} · риск ${calc['risk_usd']:.0f}"
 
 
 def tradingview_url(instrument_key: str) -> str:
@@ -1835,21 +1883,12 @@ def handle_command(chat_id, text, thread_id=None):
                 render_single_chart(df_5m, f"{label} · M5", img_5m, 60, zone_5m)
                 imgs.append(img_5m)
 
-            ai_hint = get_ai_tp_sl(label, "Лонг", "FVG (тест)", last_close, atr)
-            # Профиль риска: сначала настройки чата, иначе групповые (CHAT_ID)
+            levels = get_ai_levels(label, "Лонг", "FVG", last_close, atr)
             s = get_user_settings(chat_id)
             if not float(s.get("balance") or 0):
                 s = get_user_settings(str(CHAT_ID))
-            risk_block = build_alert_risk_block(s, symbol_key, "Лонг", last_close, atr)
-            caption = (
-                f"● <b>{label}</b> · SMC <i>(ТЕСТ)</i>\n"
-                f"<b>Лонг-сетап сформирован</b>\n"
-                f"Триггер: FVG\n"
-                f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
-                f"Цена: <code>{last_close:.5g}</code>"
-                f"{risk_block}\n\n"
-                f"{ai_hint}"
-            )
+            lot_line = format_lot_line(s, symbol_key, "Лонг", last_close, levels["sl"])
+            caption = format_alert_caption(label, "Лонг", "FVG", last_close, levels, lot_line, test=True)
             send_telegram_media_group(imgs, caption=caption, message_thread_id=SCREENER_TOPIC_ID)
             send_message(
                 CHAT_ID,
@@ -2341,23 +2380,12 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
                 render_single_chart(df_5m, f"{label} · M5", img_5m, max_bars=60, zone=zone_5m)
                 imgs.append(img_5m)
 
-            ai_hint = get_ai_tp_sl(label, direction, trigger, last_close, atr)
-            dir_label = "Лонг-сетап" if direction == "Лонг" else "Шорт-сетап"
-            risk_block = build_alert_risk_block(
-                settings, symbol_key, direction, last_close, atr
+            levels = get_ai_levels(label, direction, trigger, last_close, atr)
+            lot_line = format_lot_line(settings, symbol_key, direction, last_close, levels["sl"])
+            caption = format_alert_caption(
+                label, direction, trigger, last_close, levels, lot_line, test=False
             )
 
-            caption = (
-                f"● <b>{label}</b> · {strat['label']}\n"
-                f"<b>{dir_label} сформирован</b>\n"
-                f"Триггер: {trigger}\n"
-                f"Время алерта: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
-                f"Цена: <code>{last_close:.5g}</code>"
-                f"{risk_block}\n\n"
-                f"{ai_hint}"
-            )
-
-            # media group: все ТФ, caption на первом; кнопки — отдельным сообщением с последним фото
             send_telegram_media_group(
                 imgs,
                 caption=caption,
