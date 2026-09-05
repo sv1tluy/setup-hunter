@@ -1072,6 +1072,7 @@ def handle_command(chat_id, text, thread_id=None):
             "/instruments — выбрать инструменты для наблюдения\n"
             "/status — текущие настройки\n"
             "/example — пример алерта\n"
+            "/testalert — искусственный алерт (тест UI + AI + кнопки)\n"
             "/whereami — показать chat_id и thread_id этой темы\n\n"
             f"<i>Активная крипто-биржа: {_active_exchange_id}</i>",
             message_thread_id=thread_id,
@@ -1106,6 +1107,62 @@ def handle_command(chat_id, text, thread_id=None):
         )
     elif text == "/example":
         send_message(chat_id, EXAMPLE_TEXT, message_thread_id=thread_id)
+    elif text == "/testalert":
+        # Искусственный алерт для теста UI / AI / кнопок
+        try:
+            symbol_key = "CR_BTC"
+            label = AVAILABLE_INSTRUMENTS.get(symbol_key, {}).get("label", "BTC/USDT")
+            # Берём реальные данные если есть, иначе фейк
+            df_4h, df_15m, _ = fetch_pair_data(symbol_key)
+            if df_15m is None or len(df_15m) < 10:
+                send_message(chat_id, "⚠️ Нет данных по BTC для тестового графика. Попробуй позже.", message_thread_id=thread_id)
+                return
+            last_close = float(df_15m["Close"].iloc[-1])
+            try:
+                high_low = df_15m["High"] - df_15m["Low"]
+                high_close = (df_15m["High"] - df_15m["Close"].shift()).abs()
+                low_close = (df_15m["Low"] - df_15m["Close"].shift()).abs()
+                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                atr = float(tr.rolling(14).mean().iloc[-1])
+            except Exception:
+                atr = last_close * 0.01
+
+            img_4h = "test_4H.png"
+            img_15m = "test_15M.png"
+            render_chart(df_4h if df_4h is not None else df_15m, f"{label} · 4H Context", img_4h, max_bars=48)
+            render_chart(df_15m, f"{label} · TEST SMC · 15M", img_15m, max_bars=60)
+
+            ai_hint = get_ai_tp_sl(label, "Лонг", "FVG (тест)", last_close, atr)
+            caption = (
+                f"🎯 <b>{label}</b> <i>(ТЕСТ)</i>\n"
+                f"Стратегия: SMC: 4H Sweep/FVG + 15M FVG\n"
+                f"<b>Лонг сформирован</b>\n"
+                f"Триггер: FVG\n"
+                f"Цена: <code>{last_close:.5g}</code>\n"
+                f"Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n\n"
+                f"{ai_hint}"
+            )
+            send_telegram_media_group(
+                [img_4h, img_15m],
+                caption=f"🎯 <b>{label}</b> · Лонг (ТЕСТ)\nТриггер: FVG",
+                message_thread_id=SCREENER_TOPIC_ID,
+            )
+            send_photo_with_caption(
+                img_15m,
+                caption,
+                reply_markup=build_alert_keyboard(symbol_key),
+                message_thread_id=SCREENER_TOPIC_ID,
+            )
+            send_message(chat_id, "✅ Тестовый алерт отправлен в тему «Скринер»", message_thread_id=thread_id)
+            for p in (img_4h, img_15m):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+        except Exception as e:
+            send_message(chat_id, f"❌ Ошибка теста: {e}", message_thread_id=thread_id)
+            log.error(f"/testalert error: {e}\n{traceback.format_exc()}")
     elif text == "/status":
         s = get_user_settings(chat_id)
         strat_txt = "\n".join(
