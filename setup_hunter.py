@@ -64,6 +64,28 @@ if not BOT_TOKEN:
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DB_PATH = os.environ.get("ALERTS_DB_PATH", "bot_state.db")
+
+# Меню команд (появляется при вводе «/» в Telegram)
+BOT_COMMANDS = [
+    {"command": "start", "description": "Старт / справка"},
+    {"command": "help", "description": "Все команды"},
+    {"command": "setup", "description": "Панель управления"},
+    {"command": "strategies", "description": "Выбрать стратегии"},
+    {"command": "instruments", "description": "Выбрать инструменты"},
+    {"command": "status", "description": "Текущие настройки"},
+    {"command": "testalert", "description": "Тестовый алерт"},
+    {"command": "news", "description": "Новости Forex Factory"},
+    {"command": "risk", "description": "Риск-профиль / депозит / prop"},
+    {"command": "deposit", "description": "Задать депозит: /deposit 10000"},
+    {"command": "riskpct", "description": "Риск %: /riskpct 1"},
+    {"command": "prop", "description": "Prop: /prop 50000 5 10"},
+    {"command": "personal", "description": "Режим личного депозита"},
+    {"command": "lot", "description": "Лот: /lot BTC entry SL"},
+    {"command": "model", "description": "Выбрать модель ИИ"},
+    {"command": "img", "description": "Картинка: /img описание"},
+    {"command": "example", "description": "Пример алерта"},
+    {"command": "whereami", "description": "chat_id и thread_id"},
+]
 PAGE_SIZE = 8
 TOP_CRYPTO_N = 40
 
@@ -1231,6 +1253,50 @@ def tg_post(method, payload=None, files=None, data=None):
         return None
 
 
+def register_bot_commands():
+    """Регистрирует меню команд — при вводе «/» Telegram показывает весь список."""
+    resp = tg_post("setMyCommands", payload={"commands": BOT_COMMANDS})
+    if resp and resp.get("ok"):
+        log.info(f"Bot commands registered: {len(BOT_COMMANDS)}")
+    else:
+        log.warning(f"setMyCommands failed: {resp}")
+
+
+def format_help_text() -> str:
+    lines = [
+        "🎯 <b>Market Setup Hunter</b> — все команды\n",
+        "<b>Основное</b>",
+        "/setup — панель управления",
+        "/strategies — стратегии",
+        "/instruments — инструменты",
+        "/status — текущие настройки",
+        "/testalert — тестовый алерт",
+        "",
+        "<b>Новости</b>",
+        "/news — календарь на сегодня",
+        "/news high — только High + Medium",
+        "",
+        "<b>Риск / лот / prop</b>",
+        "/risk — профиль риска",
+        "/deposit 10000 — депозит",
+        "/riskpct 1 — % риска на сделку",
+        "/prop 50000 5 10 — prop (size, daily%, max%)",
+        "/personal — личный депозит",
+        "/lot BTC 95000 93000 — рассчитать лот",
+        "",
+        "<b>ИИ-хелпер</b> (в теме «ИИ хелпер»)",
+        "просто текст — ответ ИИ",
+        "/model — Gemini / Claude / Grok",
+        "/img описание — сгенерировать картинку",
+        "",
+        "<b>Служебное</b>",
+        "/example — пример алерта",
+        "/whereami — chat_id и thread_id",
+        "/help — этот список",
+    ]
+    return "\n".join(lines)
+
+
 def send_message(chat_id, text, reply_markup=None, message_thread_id=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup is not None:
@@ -1428,18 +1494,7 @@ def handle_command(chat_id, text, thread_id=None):
     if text in ("/start", "/help"):
         send_message(
             chat_id,
-            "🎯 <b>Market Setup Hunter</b>\n\n"
-            "/setup — панель управления (сканирование, стратегии, инструменты)\n"
-            "/strategies — выбрать активные стратегии\n"
-            "/instruments — выбрать инструменты для наблюдения\n"
-            "/status — текущие настройки\n"
-            "/example — пример алерта\n"
-            "/testalert — искусственный алерт (тест UI + AI + кнопки)\n"
-            "/news — новости Forex Factory на сегодня\n"
-            "/risk — риск-профиль / депозит / prop\n"
-            "/lot SYMBOL entry SL — рассчитать лот\n"
-            "/whereami — показать chat_id и thread_id этой темы\n\n"
-            f"<i>Активная крипто-биржа: {_active_exchange_id}</i>",
+            format_help_text() + f"\n\n<i>Крипто-биржа: {_active_exchange_id}</i>",
             message_thread_id=thread_id,
         )
     elif text == "/setup":
@@ -2477,6 +2532,7 @@ def home():
 # СТАРТ
 # =========================================================================
 init_db()
+register_bot_commands()
 
 log.info(f"CHAT_ID={CHAT_ID}, SCREENER_TOPIC={SCREENER_TOPIC_ID}, NEWS_TOPIC={NEWS_TOPIC_ID}, AI_TOPIC={AI_TOPIC_ID}")
 log.info(f"Крипто-биржа: {_active_exchange_id}, инструментов крипты: {len(CR_INSTRUMENTS)}")
