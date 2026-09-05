@@ -3,76 +3,65 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Simple Trading Hub</title>
+    <title>Trading Journal Hub</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
-        body { background-color: #0f1115; color: #e1e4ea; padding-bottom: 30px; }
+        body { background-color: #0f1115; color: #e1e4ea; padding-bottom: 40px; }
         
-        .cover { height: 140px; background: url('https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop') center/cover no-repeat; position: relative; }
-        .avatar-container { position: absolute; bottom: -25px; left: 20px; }
-        .avatar { width: 60px; height: 60px; background: #1a1d24; border: 3px solid #0f1115; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 28px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        .cover { height: 120px; background: url('https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1000&auto=format&fit=crop') center/cover no-repeat; position: relative; }
+        .avatar-container { position: absolute; bottom: -20px; left: 20px; }
+        .avatar { width: 50px; height: 50px; background: #1a1d24; border: 3px solid #0f1115; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 24px; }
         
-        .content { padding: 40px 16px 16px 16px; }
-        h1 { font-size: 24px; font-weight: 700; color: #ffffff; margin-bottom: 20px; }
+        .content { padding: 30px 16px 16px 16px; }
+        h1 { font-size: 22px; font-weight: 700; color: #ffffff; margin-bottom: 16px; }
 
-        .section-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: #6c757d; margin: 20px 0 10px 4px; }
-        .nav-card { background: #181b22; border: 1px solid #232730; border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; cursor: pointer; transition: background 0.2s; }
-        .nav-card:active { background: #222631; }
+        .section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: #6c757d; margin: 20px 0 10px 4px; }
+        .nav-card { background: #181b22; border: 1px solid #232730; border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; cursor: pointer; }
         .nav-card .left { display: flex; align-items: center; gap: 12px; font-size: 15px; font-weight: 500; color: #d1d5db; }
-        .nav-card .icon { font-size: 18px; }
 
         .view { display: none; }
         .view.active { display: block; }
         
-        .chart-box { background: #181b22; border: 1px solid #232730; border-radius: 14px; padding: 16px; margin-top: 10px; }
+        .chart-box { background: #181b22; border: 1px solid #232730; border-radius: 14px; padding: 16px; }
         
-        .form-group { display: flex; flex-direction: column; gap: 10px; background: #181b22; border: 1px solid #232730; padding: 14px; border-radius: 12px; margin-bottom: 15px; }
-        input, select { background: #0f1115; border: 1px solid #2a2f3d; color: #fff; padding: 10px 12px; border-radius: 8px; outline: none; font-size: 14px; }
+        .form-group { display: flex; flex-direction: column; gap: 10px; background: #181b22; border: 1px solid #232730; padding: 14px; border-radius: 12px; margin-bottom: 20px; }
+        input, select, textarea { background: #0f1115; border: 1px solid #2a2f3d; color: #fff; padding: 10px 12px; border-radius: 8px; outline: none; font-size: 14px; width: 100%; }
+        textarea { resize: vertical; min-height: 70px; }
         button { background: #2563eb; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px; }
-        button:active { opacity: 0.8; }
         .btn-back { background: #232730; color: #9ca3af; margin-bottom: 15px; width: fit-content; padding: 6px 12px; font-size: 13px; }
 
-        .trade-item { background: #181b22; border-left: 4px solid #4b5563; padding: 12px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
-        .trade-item.WIN { border-left-color: #10b981; }
-        .trade-item.LOSS { border-left-color: #ef4444; }
-        .trade-info { font-size: 13px; color: #9ca3af; }
-        .trade-title { font-size: 15px; font-weight: 600; color: #fff; }
-        .pnl { font-weight: 700; font-size: 14px; }
+        /* Trade Cards */
+        .trade-card { background: #181b22; border: 1px solid #232730; border-radius: 12px; padding: 14px; margin-bottom: 12px; border-left: 4px solid #4b5563; }
+        .trade-card.WIN { border-left-color: #10b981; }
+        .trade-card.LOSS { border-left-color: #ef4444; }
+        .trade-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .trade-title { font-size: 16px; font-weight: 700; color: #fff; }
+        .pnl { font-weight: 700; font-size: 15px; }
         .pnl.WIN { color: #10b981; }
         .pnl.LOSS { color: #ef4444; }
+        .trade-notes { font-size: 13px; color: #9ca3af; margin-top: 6px; line-height: 1.4; white-space: pre-wrap; }
+        .trade-img { margin-top: 10px; width: 100%; border-radius: 8px; border: 1px solid #2a2f3d; max-height: 200px; object-fit: cover; }
+        .img-link { display: inline-block; margin-top: 8px; font-size: 12px; color: #3b82f6; text-decoration: none; }
     </style>
 </head>
 <body>
 
     <!-- MAIN DASHBOARD -->
     <div id="main-view" class="view active">
-        <div class="cover">
-            <div class="avatar-container">
-                <div class="avatar">📖</div>
-            </div>
-        </div>
-        
+        <div class="cover"><div class="avatar-container"><div class="avatar">📖</div></div></div>
         <div class="content">
             <h1>Simple Trading</h1>
-
             <div class="section-title">Routine</div>
-            
             <div class="nav-card" onclick="openView('journal-view')">
-                <div class="left"><span class="icon">📔</span> Journal</div>
-                <span style="color:#4b5563">›</span>
+                <div class="left"><span>📔</span> Journal</div><span style="color:#4b5563">›</span>
             </div>
-            
             <div class="nav-card" onclick="openView('rules-view')">
-                <div class="left"><span class="icon">📈</span> Rules</div>
-                <span style="color:#4b5563">›</span>
+                <div class="left"><span>📈</span> Rules</div><span style="color:#4b5563">›</span>
             </div>
-
             <div class="section-title">Statistics</div>
-            <div class="chart-box">
-                <canvas id="equityChart" height="180"></canvas>
-            </div>
+            <div class="chart-box"><canvas id="equityChart" height="180"></canvas></div>
         </div>
     </div>
 
@@ -88,6 +77,8 @@
                 <option value="LOSS">LOSS (-% или -R)</option>
             </select>
             <input type="number" id="pnl" placeholder="Изменение % (например 2 или -1)" step="0.1">
+            <input type="text" id="imgUrl" placeholder="Ссылка на скриншот (TradingView / Imgur)">
+            <textarea id="notes" placeholder="Заметки по сделке (Контекст, FVG/Sweep, эмоции, ошибки)..."></textarea>
             <button onclick="addTrade()">Добавить сделку</button>
         </div>
 
@@ -109,10 +100,8 @@
 
     <script>
         let trades = JSON.parse(localStorage.getItem('my_trades')) || [
-            { symbol: 'BTCUSDT', result: 'WIN', pnl: 2, date: '01.09' },
-            { symbol: 'XAUUSD', result: 'LOSS', pnl: -1, date: '02.09' },
-            { symbol: 'EURUSD', result: 'WIN', pnl: 3, date: '03.09' },
-            { symbol: 'ETHUSDT', result: 'WIN', pnl: 1.5, date: '04.09' }
+            { symbol: 'BTCUSDT', result: 'WIN', pnl: 2, date: '01.09', notes: '4H Sweep + 15M FVG. Вход идеальный.', imgUrl: '' },
+            { symbol: 'XAUUSD', result: 'LOSS', pnl: -1, date: '02.09', notes: 'Поспешил, вошел до подтверждения CHoCH.', imgUrl: '' }
         ];
 
         let chartInstance = null;
@@ -127,16 +116,23 @@
             const list = document.getElementById('trades-list');
             list.innerHTML = '';
             trades.forEach((t) => {
-                const item = document.createElement('div');
-                item.className = `trade-item ${t.result}`;
-                item.innerHTML = `
-                    <div>
-                        <div class="trade-title">${t.symbol}</div>
-                        <div class="trade-info">${t.date}</div>
+                const card = document.createElement('div');
+                card.className = `trade-card ${t.result}`;
+                
+                let imgHTML = '';
+                if (t.imgUrl) {
+                    imgHTML = `<a href="${t.imgUrl}" target="_blank" class="img-link">📸 Посмотреть скриншот</a>`;
+                }
+
+                card.innerHTML = `
+                    <div class="trade-header">
+                        <span class="trade-title">${t.symbol} <small style="font-size:12px; color:#6c757d; font-weight:normal;">(${t.date})</small></span>
+                        <span class="pnl ${t.result}">${t.pnl > 0 ? '+' : ''}${t.pnl}%</span>
                     </div>
-                    <div class="pnl ${t.result}">${t.pnl > 0 ? '+' : ''}${t.pnl}%</div>
+                    ${t.notes ? `<div class="trade-notes">${t.notes}</div>` : ''}
+                    ${imgHTML}
                 `;
-                list.appendChild(item);
+                list.appendChild(card);
             });
         }
 
@@ -144,21 +140,27 @@
             const symbol = document.getElementById('symbol').value.toUpperCase();
             const result = document.getElementById('result').value;
             const pnl = parseFloat(document.getElementById('pnl').value);
+            const imgUrl = document.getElementById('imgUrl').value.trim();
+            const notes = document.getElementById('notes').value.trim();
 
-            if (!symbol || isNaN(pnl)) return alert('Заполни все поля!');
+            if (!symbol || isNaN(pnl)) return alert('Заполни символ и PnL!');
 
             const newTrade = {
                 symbol,
                 result,
                 pnl,
+                imgUrl,
+                notes,
                 date: new Date().toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' })
             };
 
-            trades.push(newTrade);
+            trades.unshift(newTrade);
             localStorage.setItem('my_trades', JSON.stringify(trades));
 
             document.getElementById('symbol').value = '';
             document.getElementById('pnl').value = '';
+            document.getElementById('imgUrl').value = '';
+            document.getElementById('notes').value = '';
 
             renderTrades();
             alert('Сделка сохранена!');
@@ -171,7 +173,7 @@
             const labels = ['0'];
             const dataPoints = [0];
 
-            trades.forEach((t, i) => {
+            [...trades].reverse().forEach((t, i) => {
                 currentEquity += t.pnl;
                 labels.push(`${i + 1}`);
                 dataPoints.push(currentEquity);
