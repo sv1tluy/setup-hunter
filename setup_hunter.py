@@ -2,10 +2,11 @@
 Market Setup Hunter — Trading Hub Bot
 =====================================
 Темы:
-  Скринер   (thread 2)
-  Новости   (thread 3)
-  Журнал    (thread 4) — скипаем, будет web-app
-  ИИ хелпер (thread 5)
+  Скринер      (thread 2)
+  Новости      (thread 3)
+  Журнал       (thread 4) — скипаем
+  ИИ хелпер    (thread 5)
+  Обзор рынка  (thread 6, MARKET_TOPIC_ID)
 
 Запуск на Render: gunicorn -w 1 bot:app
 """
@@ -40,8 +41,10 @@ log = logging.getLogger("trading_hub")
 try:
     from zoneinfo import ZoneInfo
     NY_TZ = ZoneInfo("America/New_York")
+    MSK_TZ = ZoneInfo("Europe/Moscow")
 except Exception:
     NY_TZ = None
+    MSK_TZ = timezone(timedelta(hours=3))
 
 app = Flask(__name__)
 
@@ -57,6 +60,10 @@ SCREENER_TOPIC_ID = int(os.environ.get("SCREENER_TOPIC_ID", "2"))
 NEWS_TOPIC_ID = int(os.environ.get("NEWS_TOPIC_ID", "3"))
 # JOURNAL_TOPIC_ID = 4  — скипаем
 AI_TOPIC_ID = int(os.environ.get("AI_TOPIC_ID", "5"))
+MARKET_TOPIC_ID = int(os.environ.get("MARKET_TOPIC_ID", "6"))
+OVERVIEW_TZ = os.environ.get("OVERVIEW_TZ", "Europe/Moscow")
+OVERVIEW_MORNING_HOUR = int(os.environ.get("OVERVIEW_MORNING_HOUR", "8"))
+OVERVIEW_WEEKLY_HOUR = int(os.environ.get("OVERVIEW_WEEKLY_HOUR", "10"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
@@ -75,6 +82,8 @@ BOT_COMMANDS = [
     {"command": "status", "description": "Текущие настройки"},
     {"command": "testalert", "description": "Тестовый алерт"},
     {"command": "news", "description": "Новости Forex Factory"},
+    {"command": "brief", "description": "Утренний обзор рынка"},
+    {"command": "weekplan", "description": "Торговый план на неделю"},
     {"command": "risk", "description": "Риск-профиль / депозит / prop"},
     {"command": "deposit", "description": "Задать депозит: /deposit 10000"},
     {"command": "riskpct", "description": "Риск %: /riskpct 1"},
@@ -190,9 +199,12 @@ def init_crypto_exchanges() -> str:
 
 
 def build_crypto_universe(n: int = TOP_CRYPTO_N) -> Dict[str, dict]:
-    must_include = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    must_include = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "TON/USDT", "XRP/USDT", "BNB/USDT"]
     if _active_exchange_id == "fallback" or crypto_spot is None:
-        fallback = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT"]
+        fallback = [
+            "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+            "XRP/USDT", "ADA/USDT", "DOGE/USDT", "TON/USDT", "AVAX/USDT", "LINK/USDT",
+        ]
         return {f"CR_{s.split('/')[0]}": {"label": s, "kind": "crypto", "ticker": s} for s in fallback}
 
     try:
@@ -218,7 +230,10 @@ def build_crypto_universe(n: int = TOP_CRYPTO_N) -> Dict[str, dict]:
         return universe
     except Exception as e:
         log.warning(f"Не удалось получить топ крипты: {e}. Fallback.")
-        fallback = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT"]
+        fallback = [
+            "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+            "XRP/USDT", "ADA/USDT", "DOGE/USDT", "TON/USDT", "AVAX/USDT", "LINK/USDT",
+        ]
         return {f"CR_{s.split('/')[0]}": {"label": s, "kind": "crypto", "ticker": s} for s in fallback}
 
 
@@ -227,6 +242,17 @@ init_crypto_exchanges()
 CR_INSTRUMENTS = build_crypto_universe()
 
 AVAILABLE_INSTRUMENTS = {**FX_INSTRUMENTS, **MT_INSTRUMENTS, **CR_INSTRUMENTS, **NQ_INSTRUMENTS}
+
+# Обзор рынка: все мажоры FX + металлы + ядро крипты
+OVERVIEW_ASSET_KEYS = [
+    "FX_EURUSD", "FX_GBPUSD", "FX_USDJPY", "FX_USDCHF",
+    "FX_AUDUSD", "FX_USDCAD", "FX_NZDUSD",
+    "MT_XAUUSD_GCF", "MT_XAGUSD_SIF",
+    "CR_BTC", "CR_ETH", "CR_SOL", "CR_DOGE", "CR_TON",
+    "CR_XRP", "CR_BNB", "CR_AVAX", "CR_LINK",
+]
+# новости FF: валюты этих активов
+OVERVIEW_FF_CCY = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"}
 
 INSTRUMENT_CATEGORIES = {
     "fx": {"title": "Форекс (мажоры)", "items": FX_INSTRUMENTS},
@@ -245,7 +271,7 @@ DEFAULT_SETTINGS = {
     "smc_trigger_fvg": True,
     "notify_always": False,
     "scanning_enabled": True,
-    "ai_model": "gemini",  # gemini | claude | grok
+    "ai_model": "auto",  # auto | gemini | groq | mistral | openrouter | claude | grok
     # --- Риск / депозит / prop ---
     "account_type": "personal",  # personal | prop
     "balance": 0.0,              # размер депозита / prop
@@ -259,6 +285,9 @@ DEFAULT_SETTINGS = {
 # API keys for AI models (env)
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
 GROK_API_KEY = os.environ.get("GROK_API_KEY") or os.environ.get("XAI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 # Приблизительная стоимость 1 пункта / pip для расчёта лота (USD)
 # Для крипты: $ на 1 USDT движения цены на 1 монету
@@ -736,6 +765,26 @@ def set_update_offset(offset: int):
         conn.close()
 
 
+def get_meta(key: str, default: str = "") -> str:
+    with db_lock:
+        conn = _get_conn()
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        conn.close()
+    return row[0] if row else default
+
+
+def set_meta(key: str, value: str):
+    with db_lock:
+        conn = _get_conn()
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+        conn.close()
+
+
 # =========================================================================
 # ИНДИКАТОРЫ И СТРАТЕГИИ (без изменений логики)
 # =========================================================================
@@ -1144,9 +1193,10 @@ def fetch_pair_data(instrument_key: str):
 # Модели по приоритету (если одна упёрлась в квоту — пробуем следующую)
 GEMINI_MODELS = [
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-flash-latest",
-    "gemini-3.6-flash",
     "gemini-2.0-flash",
+    "gemini-3.6-flash",
 ]
 
 
@@ -1900,6 +1950,24 @@ def handle_command(chat_id, text, thread_id=None):
                 send_message(CHAT_ID, text_out, message_thread_id=NEWS_TOPIC_ID)
         except Exception as e:
             send_message(chat_id, f"❌ Ошибка загрузки новостей: {e}", message_thread_id=thread_id)
+    elif text in ("/brief", "/overview"):
+        send_message(chat_id, "⏳ Собираю утренний обзор…", message_thread_id=thread_id)
+        try:
+            text_out = format_morning_brief()
+            send_message(chat_id, text_out, message_thread_id=thread_id)
+            if thread_id != MARKET_TOPIC_ID:
+                post_to_market_topic(text_out)
+        except Exception as e:
+            send_message(chat_id, f"❌ Обзор: {e}", message_thread_id=thread_id)
+    elif text in ("/weekplan", "/plan"):
+        send_message(chat_id, "⏳ Собираю план на неделю…", message_thread_id=thread_id)
+        try:
+            text_out = format_weekly_plan()
+            send_message(chat_id, text_out, message_thread_id=thread_id)
+            if thread_id != MARKET_TOPIC_ID:
+                post_to_market_topic(text_out)
+        except Exception as e:
+            send_message(chat_id, f"❌ План: {e}", message_thread_id=thread_id)
     elif text == "/testalert":
         try:
             symbol_key = "CR_BTC"
@@ -2041,7 +2109,7 @@ def handle_callback(callback_query):
         answer_callback_query(callback_id)
     elif data.startswith("aimodel:"):
         model = data.split(":", 1)[1]
-        if model in ("gemini", "claude", "grok"):
+        if model in ("auto", "gemini", "groq", "mistral", "openrouter", "claude", "grok"):
             save_user_settings(chat_id, ai_model=model)
             thread_id = callback_query.get("message", {}).get("message_thread_id")
             try:
@@ -2103,45 +2171,68 @@ def handle_callback(callback_query):
 # ИИ-ХЕЛПЕР (тема 5)
 # =========================================================================
 AI_SYSTEM_PROMPT = (
-    "Ты — торговый ассистент в Telegram-группе Trading Hub. "
-    "Отвечай на русском, кратко и по делу. Помогаешь с SMC, FVG, Sweep, BOS, "
-    "риском, TP/SL, психологией трейдинга и разбором идей. "
-    "Не давай финансовых советов в юридическом смысле — это образование. "
-    "Если просят картинку — скажи использовать /img промпт."
+    "Ты старший трейдер-наставник (SMC/ICT) в Telegram. Русский язык. "
+    "Правила:\n"
+    "1) Коротко. Без воды, без мотивашек, без «отличный RR».\n"
+    "2) Если нет цены/графика — не выдумывай уровни. Скажи, каких данных не хватает.\n"
+    "3) SL/TP — конкретные числа или логика «за свинг / за OB / за FVG».\n"
+    "4) Крипта: сначала контекст BTC, потом альта.\n"
+    "5) Риск: считай от депозита/prop, не советуй «1–2%» в вакууме, если есть цифры.\n"
+    "6) Это обучение, не индивидуальная инвестиционная рекомендация.\n"
+    "7) Картинка — команда /img."
 )
+
+
+class AIProviderError(Exception):
+    """Провайдер недоступен / квота — пробуем следующего."""
+
+
+def _openai_chat(base_url: str, api_key: str, model_name: str, user_text: str, extra_headers=None) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    resp = requests.post(
+        f"{base_url.rstrip('/')}/chat/completions",
+        headers=headers,
+        json={
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": AI_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 900,
+        },
+        timeout=60,
+    )
+    if resp.status_code in (429, 503, 402):
+        raise AIProviderError(f"{model_name} {resp.status_code}")
+    if resp.status_code != 200:
+        raise AIProviderError(f"{model_name} {resp.status_code}: {resp.text[:160]}")
+    data = resp.json()
+    text = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
+    )
+    if not text:
+        raise AIProviderError(f"{model_name} empty")
+    return text
 
 
 def _chat_gemini(user_text: str) -> str:
     if not GEMINI_API_KEY:
-        return "⚠️ GEMINI_API_KEY не задан. Добавь ключ в Environment на Render."
-    try:
-        text = _gemini_generate(f"{AI_SYSTEM_PROMPT}\n\nПользователь: {user_text}")
-        return text
-    except RuntimeError as e:
-        if str(e) == "quota":
-            return (
-                "⚠️ <b>Квота Gemini на сегодня закончилась</b> (free tier ~20–50 req/день).\n\n"
-                "Что сделать:\n"
-                "• подожди сброса (обычно по UTC)\n"
-                "• или создай новый ключ в AI Studio\n"
-                "• или переключись: <code>/model</code> → Claude / Grok\n"
-                "• или включи billing в Google AI"
-            )
-        if str(e) == "no_key":
-            return "⚠️ GEMINI_API_KEY не задан."
-        return f"❌ Gemini: {e}"
-    except Exception as e:
-        err = str(e)
-        if "429" in err or "RESOURCE_EXHAUSTED" in err:
-            return (
-                "⚠️ Лимит Gemini (429). Подожди ~1 мин или смени модель: <code>/model</code>"
-            )
-        return f"❌ Gemini: {err[:300]}"
+        raise AIProviderError("no gemini key")
+    return _gemini_generate(f"{AI_SYSTEM_PROMPT}\n\nПользователь: {user_text}")
 
 
 def _chat_claude(user_text: str) -> str:
     if not CLAUDE_API_KEY:
-        return "⚠️ CLAUDE_API_KEY / ANTHROPIC_API_KEY не задан."
+        raise AIProviderError("no claude key")
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -2151,77 +2242,145 @@ def _chat_claude(user_text: str) -> str:
         },
         json={
             "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1024,
+            "max_tokens": 900,
             "system": AI_SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": user_text}],
         },
         timeout=60,
     )
+    if resp.status_code in (429, 529):
+        raise AIProviderError("claude quota")
     if resp.status_code != 200:
-        return f"❌ Claude error {resp.status_code}: {resp.text[:200]}"
+        raise AIProviderError(f"claude {resp.status_code}")
     data = resp.json()
     parts = data.get("content") or []
     texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
-    return "\n".join(texts).strip() or "Пустой ответ."
+    text = "\n".join(texts).strip()
+    if not text:
+        raise AIProviderError("claude empty")
+    return text
 
 
 def _chat_grok(user_text: str) -> str:
     if not GROK_API_KEY:
-        return "⚠️ GROK_API_KEY / XAI_API_KEY не задан."
-    resp = requests.post(
-        "https://api.x.ai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {GROK_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "grok-3",
-            "messages": [
-                {"role": "system", "content": AI_SYSTEM_PROMPT},
-                {"role": "user", "content": user_text},
-            ],
-            "temperature": 0.7,
-        },
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        return f"❌ Grok error {resp.status_code}: {resp.text[:200]}"
-    data = resp.json()
+        raise AIProviderError("no grok key")
+    return _openai_chat("https://api.x.ai/v1", GROK_API_KEY, "grok-3", user_text)
+
+
+def _chat_groq(user_text: str) -> str:
+    if not GROQ_API_KEY:
+        raise AIProviderError("no groq key")
+    last = None
+    for m in ("qwen/qwen3.6-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"):
+        try:
+            return _openai_chat("https://api.groq.com/openai/v1", GROQ_API_KEY, m, user_text)
+        except Exception as e:
+            last = e
+            continue
+    raise AIProviderError(str(last) if last else "groq fail")
+
+
+def _chat_mistral(user_text: str) -> str:
+    if not MISTRAL_API_KEY:
+        raise AIProviderError("no mistral key")
+    last = None
+    for m in ("mistral-small-latest", "mistral-medium-latest"):
+        try:
+            return _openai_chat("https://api.mistral.ai/v1", MISTRAL_API_KEY, m, user_text)
+        except Exception as e:
+            last = e
+            continue
+    raise AIProviderError(str(last) if last else "mistral fail")
+
+
+def _chat_openrouter(user_text: str) -> str:
+    if not OPENROUTER_API_KEY:
+        raise AIProviderError("no openrouter key")
+    last = None
+    for m in (
+        "openrouter/free",
+        "qwen/qwen3-32b:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ):
+        try:
+            return _openai_chat(
+                "https://openrouter.ai/api/v1",
+                OPENROUTER_API_KEY,
+                m,
+                user_text,
+                extra_headers={"HTTP-Referer": "https://t.me", "X-Title": "TradingHub"},
+            )
+        except Exception as e:
+            last = e
+            continue
+    raise AIProviderError(str(last) if last else "openrouter fail")
+
+
+AI_PROVIDERS = {
+    "gemini": _chat_gemini,
+    "groq": _chat_groq,
+    "mistral": _chat_mistral,
+    "openrouter": _chat_openrouter,
+    "claude": _chat_claude,
+    "grok": _chat_grok,
+}
+
+# Порядок авто: умные + высокие лимиты первыми
+AI_AUTO_ORDER = ["groq", "gemini", "mistral", "openrouter", "claude", "grok"]
+
+
+def ai_chat(user_text: str, model: str = "auto") -> str:
+    model = (model or "auto").lower()
+    if model == "auto":
+        order = list(AI_AUTO_ORDER)
+    else:
+        order = [model] + [p for p in AI_AUTO_ORDER if p != model]
+
+    errors = []
+    for name in order:
+        fn = AI_PROVIDERS.get(name)
+        if not fn:
+            continue
+        try:
+            text = fn(user_text)
+            if text:
+                if model == "auto" or name != model:
+                    return f"<i>[{name}]</i>\n{text}"
+                return text
+        except Exception as e:
+            log.warning(f"AI {name}: {e}")
+            errors.append(f"{name}: {e}")
+            continue
     return (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-        or "Пустой ответ."
+        "❌ Все ИИ-провайдеры недоступны или без ключей.\n"
+        "Добавь в Render Environment хотя бы:\n"
+        "<code>GROQ_API_KEY</code> и/или <code>GEMINI_API_KEY</code>\n"
+        f"<i>{'; '.join(errors)[:400]}</i>"
     )
-
-
-def ai_chat(user_text: str, model: str = "gemini") -> str:
-    model = (model or "gemini").lower()
-    try:
-        if model == "claude":
-            return _chat_claude(user_text)
-        if model == "grok":
-            return _chat_grok(user_text)
-        return _chat_gemini(user_text)
-    except Exception as e:
-        log.error(f"AI chat ({model}) error: {e}")
-        return f"❌ Ошибка ИИ ({model}): {e}"
 
 
 def build_ai_model_keyboard(chat_id: str) -> dict:
     s = get_user_settings(chat_id)
-    current = s.get("ai_model", "gemini")
+    current = s.get("ai_model", "auto")
     models = [
+        ("auto", "Auto"),
+        ("groq", "Groq"),
         ("gemini", "Gemini"),
+        ("mistral", "Mistral"),
+        ("openrouter", "OpenRouter"),
         ("claude", "Claude"),
         ("grok", "Grok"),
     ]
-    row = []
+    rows, row = [], []
     for mid, label in models:
         mark = "✅ " if mid == current else ""
         row.append({"text": f"{mark}{label}", "callback_data": f"aimodel:{mid}"})
-    return {"inline_keyboard": [row]}
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return {"inline_keyboard": rows}
 
 
 def gemini_image(prompt: str, out_path: str) -> bool:
@@ -2273,7 +2432,7 @@ def handle_ai_message(chat_id: str, text: str, thread_id=None):
         return
 
     settings = get_user_settings(chat_id)
-    model = settings.get("ai_model", "gemini")
+    model = settings.get("ai_model", "auto")
 
     if text.startswith("/img ") or text.startswith("/image "):
         prompt = text.split(" ", 1)[1].strip()
@@ -2298,9 +2457,11 @@ def handle_ai_message(chat_id: str, text: str, thread_id=None):
         send_message(
             chat_id,
             f"🤖 Выбери модель ИИ\nТекущая: <b>{model}</b>\n\n"
-            "• <b>Gemini</b> — бесплатно (нужен GEMINI_API_KEY)\n"
-            "• <b>Claude</b> — Anthropic (CLAUDE_API_KEY)\n"
-            "• <b>Grok</b> — xAI (GROK_API_KEY / XAI_API_KEY)",
+            "• <b>Auto</b> — сам берёт живого провайдера (рекомендую)\n"
+            "• <b>Groq</b> — умный + ~1000 SMS/день (GROQ_API_KEY)\n"
+            "• <b>Gemini</b> — GEMINI_API_KEY\n"
+            "• <b>Mistral / OpenRouter</b> — свои ключи\n"
+            "• Claude / Grok — платные ключи",
             reply_markup=build_ai_model_keyboard(chat_id),
             message_thread_id=thread_id,
         )
@@ -2351,7 +2512,8 @@ def run_telegram_polling():
                     text = update["message"]["text"]
                     # Сообщения в теме ИИ-хелпер → AI
                     if thread_id == AI_TOPIC_ID and not text.startswith(
-                        ("/setup", "/strategies", "/instruments", "/status", "/news", "/testalert", "/whereami", "/example")
+                        ("/setup", "/strategies", "/instruments", "/status", "/news", "/testalert",
+                         "/whereami", "/example", "/brief", "/weekplan", "/overview", "/plan", "/risk", "/deposit", "/help")
                     ):
                         handle_ai_message(chat_id, text, thread_id=thread_id)
                     else:
@@ -2736,8 +2898,153 @@ def run_news_background():
 
 
 # =========================================================================
-# FLASK
+# ОБЗОР РЫНКА (утренний бриф + воскресный план)
 # =========================================================================
+def _now_msk():
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        return datetime.now(_ZI(OVERVIEW_TZ))
+    except Exception:
+        return datetime.now(MSK_TZ)
+
+
+def overview_keys() -> List[str]:
+    return [k for k in OVERVIEW_ASSET_KEYS if k in AVAILABLE_INSTRUMENTS]
+
+
+def snapshot_asset(key: str) -> Optional[dict]:
+    """Цена и простой 4H-bias."""
+    info = AVAILABLE_INSTRUMENTS.get(key) or {}
+    label = info.get("label", key)
+    try:
+        df_4h, df_15m, _, _ = fetch_pair_data(key)
+    except Exception:
+        df_4h = df_15m = None
+    df = df_4h if df_4h is not None and len(df_4h) >= 5 else df_15m
+    if df is None or len(df) < 3:
+        return {"key": key, "label": label, "price": None, "chg": None, "bias": "нет данных"}
+    last = float(df["Close"].iloc[-1])
+    prev = float(df["Close"].iloc[-2])
+    chg = ((last - prev) / prev * 100.0) if prev else 0.0
+    bias = "—"
+    if df_4h is not None and len(df_4h) >= 30:
+        ema = compute_ema(df_4h["Close"], 50)
+        e = float(ema.iloc[-1])
+        if last > e and ema.iloc[-1] >= ema.iloc[-5]:
+            bias = "бычий 4H"
+        elif last < e and ema.iloc[-1] <= ema.iloc[-5]:
+            bias = "медвежий 4H"
+        else:
+            bias = "флэт / смешанный 4H"
+    return {"key": key, "label": label, "price": last, "chg": chg, "bias": bias}
+
+
+def format_morning_brief() -> str:
+    now = _now_msk()
+    lines = [
+        f"☀️ <b>Утренний обзор</b> · {now.strftime('%d.%m.%Y %H:%M')} МСК\n",
+        "<b>Форекс + металлы + крипта</b>",
+    ]
+    fx_keys = [k for k in overview_keys() if k.startswith("FX_") or k.startswith("MT_")]
+    cr_keys = [k for k in overview_keys() if k.startswith("CR_")]
+
+    lines.append("\n💱 <b>Валюты / металлы</b>")
+    for k in fx_keys:
+        s = snapshot_asset(k)
+        if not s or s["price"] is None:
+            lines.append(f"• {AVAILABLE_INSTRUMENTS.get(k, {}).get('label', k)} — нет котировки")
+            continue
+        sign = "+" if s["chg"] >= 0 else ""
+        lines.append(f"• <b>{s['label']}</b> <code>{s['price']:.5g}</code> {sign}{s['chg']:.2f}% · {s['bias']}")
+
+    lines.append("\n🪙 <b>Крипта</b>")
+    for k in cr_keys:
+        s = snapshot_asset(k)
+        if not s or s["price"] is None:
+            lines.append(f"• {k} — нет котировки")
+            continue
+        sign = "+" if s["chg"] >= 0 else ""
+        lines.append(f"• <b>{s['label']}</b> <code>{s['price']:.5g}</code> {sign}{s['chg']:.2f}% · {s['bias']}")
+
+    # Новости FF по валютам обзора
+    try:
+        events = fetch_forexfactory_events()
+        important = [
+            e for e in events
+            if e.get("impact") in ("high", "medium")
+            and (e.get("currency") or "").upper() in OVERVIEW_FF_CCY
+        ]
+    except Exception:
+        important = []
+    lines.append("\n📅 <b>Новости дня (High/Medium)</b>")
+    if not important:
+        lines.append("Важных событий по мажорам нет / календарь недоступен.")
+    else:
+        emap = {"high": "🔴", "medium": "🟠"}
+        for e in important[:18]:
+            em = emap.get(e["impact"], "•")
+            lines.append(f"{em} <b>{e.get('time_str') or '—'}</b> {e.get('currency')} — {e['title']}")
+        lines.append("\n<i>Крипта новостями FF не покрывается — смотри BTC как лидера альтов.</i>")
+    text = "\n".join(lines)
+    return text[:3900]
+
+
+def format_weekly_plan() -> str:
+    now = _now_msk()
+    # понедельник текущей/следующей недели
+    monday = now.date() + timedelta(days=(7 - now.weekday()) % 7)
+    if now.weekday() == 6:  # воскресенье — план на грядущую неделю
+        week_from = now.date() + timedelta(days=1)
+    else:
+        week_from = now.date() - timedelta(days=now.weekday())
+    week_to = week_from + timedelta(days=6)
+    lines = [
+        f"🗓 <b>План на неделю</b> {week_from.strftime('%d.%m')}–{week_to.strftime('%d.%m.%Y')}\n",
+        "Сценарий по 4H EMA50. Не сигнал на вход — карта рынка.\n",
+    ]
+    for k in overview_keys():
+        s = snapshot_asset(k)
+        if not s:
+            continue
+        px = f"{s['price']:.5g}" if s["price"] is not None else "—"
+        lines.append(f"• <b>{s['label']}</b> {px} — {s['bias']}")
+    lines.append(
+        "\nПравила недели:\n"
+        "1) Сначала BTC 4H, потом ETH/SOL/альты.\n"
+        "2) Форекс — не торговать за 15 мин до 🔴 новости по валюте пары.\n"
+        "3) Золото чувствительно к USD и ставке.\n"
+        "4) Один сетап = один вход, без докупок в ту же идею."
+    )
+    return "\n".join(lines)[:3900]
+
+
+def post_to_market_topic(text: str):
+    send_message(CHAT_ID, text, message_thread_id=MARKET_TOPIC_ID)
+
+
+def run_overview_background():
+    """Пн–Сб ~08:30 МСК бриф; Вс ~10:00 МСК недельный план."""
+    time.sleep(12)
+    log.info(f"Market overview started → topic {MARKET_TOPIC_ID}")
+    while True:
+        try:
+            now = _now_msk()
+            today = now.strftime("%Y-%m-%d")
+            # утренний бриф пн–сб
+            if now.weekday() < 6 and now.hour == OVERVIEW_MORNING_HOUR and now.minute < 20:
+                if get_meta("last_morning_brief") != today:
+                    post_to_market_topic(format_morning_brief())
+                    set_meta("last_morning_brief", today)
+                    log.info("Morning brief posted")
+            # воскресенье — план недели
+            if now.weekday() == 6 and now.hour == OVERVIEW_WEEKLY_HOUR and now.minute < 20:
+                if get_meta("last_weekly_plan") != today:
+                    post_to_market_topic(format_weekly_plan())
+                    set_meta("last_weekly_plan", today)
+                    log.info("Weekly plan posted")
+        except Exception as e:
+            log.error(f"Overview error: {e}\n{traceback.format_exc()}")
+        time.sleep(60)
 @app.route("/api/status")
 def get_status():
     return jsonify(market_data)
@@ -2754,12 +3061,13 @@ def home():
 init_db()
 register_bot_commands()
 
-log.info(f"CHAT_ID={CHAT_ID}, SCREENER_TOPIC={SCREENER_TOPIC_ID}, NEWS_TOPIC={NEWS_TOPIC_ID}, AI_TOPIC={AI_TOPIC_ID}")
+log.info(f"CHAT_ID={CHAT_ID}, SCREENER={SCREENER_TOPIC_ID}, NEWS={NEWS_TOPIC_ID}, AI={AI_TOPIC_ID}, MARKET={MARKET_TOPIC_ID}")
 log.info(f"Крипто-биржа: {_active_exchange_id}, инструментов крипты: {len(CR_INSTRUMENTS)}")
 
 threading.Thread(target=run_scanner_background, daemon=True).start()
 threading.Thread(target=run_telegram_polling, daemon=True).start()
 threading.Thread(target=run_news_background, daemon=True).start()
+threading.Thread(target=run_overview_background, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
