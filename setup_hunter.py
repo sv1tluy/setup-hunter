@@ -266,7 +266,7 @@ INSTRUMENT_CATEGORIES = {
 
 DEFAULT_SETTINGS = {
     "symbols": ["FX_EURUSD", "FX_GBPUSD", "MT_XAUUSD_GCF", "CR_BTC", "CR_ETH", "CR_SOL"],
-    "enabled_strategies": ["smc_liq_bos_ob"],
+    "enabled_strategies": ["smc_liq_bos_ob", "break_hold", "compression_break"],
     "smc_trigger_sweep": True,
     "smc_trigger_fvg": True,
     "notify_always": False,
@@ -745,6 +745,31 @@ def should_skip_alert(alert_key: str, signal_time_str: str, notify_always: bool 
     return info is not None
 
 
+PAIR_DIR_LOCK_MINUTES = int(os.environ.get("PAIR_DIR_LOCK_MINUTES", "120"))
+
+
+def pair_dir_lock_key(symbol_key: str, direction: str) -> str:
+    return f"lock:{symbol_key}:{direction}"
+
+
+def pair_dir_is_locked(symbol_key: str, direction: str) -> bool:
+    info = get_last_alert_info(pair_dir_lock_key(symbol_key, direction))
+    if not info:
+        return False
+    try:
+        sent_at = datetime.fromisoformat(info["sent_at"])
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - sent_at).total_seconds() / 60.0
+        return elapsed < PAIR_DIR_LOCK_MINUTES
+    except Exception:
+        return True
+
+
+def lock_pair_dir(symbol_key: str, direction: str):
+    set_last_alert_time(pair_dir_lock_key(symbol_key, direction), datetime.now(timezone.utc).isoformat())
+
+
 def get_update_offset() -> int:
     with db_lock:
         conn = _get_conn()
@@ -1209,12 +1234,117 @@ def detect_smc_liq_bos_ob(df_4h, df_15m, settings):
     }
 
 
+def detect_break_hold(df_4h, df_15m, settings):
+    """
+    Пробой уровня + закреп: закрытие за свинг и удержание / ретест.
+    По тренду H4, вынос ≥ 0.3 ATR, новость не режет.
+    """
+    trend = htf_structure_trend(df_4h)
+    if trend is None or df_15m is None or len(df_15m) < 30:
+        return None
+    symbol_key = settings.get("_symbol") or ""
+    if symbol_key and news_blocks_pair(symbol_key, minutes=20):
+        return None
+    highs, lows = find_swings(df_15m, lookback=3)
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    atr = _m15_atr(df_15m)
+    is_long = trend == "Лонг"
+    lvl = highs[-1][1] if is_long else lows[-1][1]
+    lvl_t = highs[-1][0] if is_long else lows[-1][0]
+    # уровень не должен быть самой последней свечой
+    if lvl_t >= df_15m.index[-3]:
+        return None
+    closes = df_15m["Close"]
+    last_c = float(closes.iloc[-1])
+    prev_c = float(closes.iloc[-2])
+    last_o = float(df_15m["Open"].iloc[-1])
+    body = abs(last_c - last_o)
+    if body < atr * 0.20:
+        return None
+    if is_long:
+        broke = last_c > lvl and (last_c - lvl) >= atr * 0.30
+        held = prev_c > lvl and last_c > lvl
+        retest = float(df_15m["Low"].iloc[-1]) <= lvl <= float(df_15m["High"].iloc[-1]) and last_c > lvl
+    else:
+        broke = last_c < lvl and (lvl - last_c) >= atr * 0.30
+        held = prev_c < lvl and last_c < lvl
+        retest = float(df_15m["Low"].iloc[-1]) <= lvl <= float(df_15m["High"].iloc[-1]) and last_c < lvl
+    # только закреп или ретест — голый пробой дублирует BOS
+    if not (held or retest):
+        return None
+    window = df_15m.iloc[-8:]
+    if is_long and not (window["Close"] > lvl).any():
+        return None
+    if (not is_long) and not (window["Close"] < lvl).any():
+        return None
+    stage = "ретест" if retest else "закреп"
+    setup_id = f"bh:{trend}:{lvl_t.isoformat()}:{round(lvl, 5)}"
+    return {
+        "time": df_15m.index[-1],
+        "direction": trend,
+        "trigger": f"Пробой+закреп ({stage})",
+        "setup_id": setup_id,
+    }
+
+
+def detect_compression_break(df_4h, df_15m, settings):
+    """
+    Выход из сжатия: узкий диапазон 8–16 свечей M15, затем импульсный выход по тренду H4.
+    """
+    trend = htf_structure_trend(df_4h)
+    if trend is None or df_15m is None or len(df_15m) < 40:
+        return None
+    symbol_key = settings.get("_symbol") or ""
+    if symbol_key and news_blocks_pair(symbol_key, minutes=20):
+        return None
+    atr = _m15_atr(df_15m)
+    box = df_15m.iloc[-16:-1]
+    rng = float(box["High"].max() - box["Low"].min())
+    if rng <= 0 or rng > atr * 1.35:
+        return None  # не сжатие
+    top, bot = float(box["High"].max()), float(box["Low"].min())
+    last_c = float(df_15m["Close"].iloc[-1])
+    last_o = float(df_15m["Open"].iloc[-1])
+    body = abs(last_c - last_o)
+    if body < atr * 0.30:
+        return None
+    is_long = trend == "Лонг"
+    if is_long and last_c <= top:
+        return None
+    if (not is_long) and last_c >= bot:
+        return None
+    # выход должен быть заметным
+    if is_long and (last_c - top) < atr * 0.15:
+        return None
+    if (not is_long) and (bot - last_c) < atr * 0.15:
+        return None
+    setup_id = f"cb:{trend}:{box.index[0].isoformat()}:{round(top,5)}:{round(bot,5)}"
+    return {
+        "time": df_15m.index[-1],
+        "direction": trend,
+        "trigger": "Выход из сжатия",
+        "setup_id": setup_id,
+    }
+
+
 STRATEGIES = {
     "smc_liq_bos_ob": {
         "label": "SMC: Sweep + BOS + OB/FVG",
         "detect": detect_smc_liq_bos_ob,
         "configurable": False,
     },
+    "break_hold": {
+        "label": "Пробой + закреп (M15 по тренду H4)",
+        "detect": detect_break_hold,
+        "configurable": False,
+    },
+    "compression_break": {
+        "label": "Выход из сжатия (M15)",
+        "detect": detect_compression_break,
+        "configurable": False,
+    },
+
     "smc_sweep_fvg": {
         "label": "SMC: 4H Sweep/FVG + 15M FVG",
         "detect": detect_smc_sweep_fvg,
@@ -2758,6 +2888,9 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
         if should_skip_alert(alert_key, signal_time_str):
             fired_statuses.append(f"{strat['label']}: этот сетап уже отправлен")
             continue
+        if pair_dir_is_locked(symbol_key, direction):
+            fired_statuses.append(f"{strat['label']}: уже был алерт по {direction} недавно")
+            continue
         fired_statuses.append(f"🔥 {strat['label']}: {direction}")
 
         imgs = []
@@ -2811,6 +2944,7 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
                 message_thread_id=SCREENER_TOPIC_ID,
             )
             set_last_alert_time(alert_key, signal_time_str)
+            lock_pair_dir(symbol_key, direction)
             log.info(f"✅ Алерт по {symbol_key} ({sid}) отправлен в тему {SCREENER_TOPIC_ID}")
         except Exception as e:
             log.error(f"Ошибка отправки алерта {symbol_key}: {e}\n{traceback.format_exc()}")
