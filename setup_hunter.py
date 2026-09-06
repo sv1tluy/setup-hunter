@@ -2429,12 +2429,11 @@ def handle_callback(callback_query):
         )
         answer_callback_query(callback_id)
     elif data.startswith("stratcfg:") or data == "open_smc_settings":
-        # Всегда отправляем НОВОЕ сообщение — edit на фото-алерте не работает
         thread_id = callback_query.get("message", {}).get("message_thread_id")
         send_message(
             chat_id,
-            SMC_SETUP_TEXT,
-            reply_markup=build_smc_cfg_keyboard(chat_id),
+            "● <b>Сетапы</b>\n\nНажми кнопку — включить или выключить.\n✅ работает · ⬜ выключен",
+            reply_markup=build_strategies_keyboard(chat_id),
             message_thread_id=thread_id,
         )
         answer_callback_query(callback_id)
@@ -2471,12 +2470,8 @@ def handle_callback(callback_query):
         else:
             answer_callback_query(callback_id)
     elif data == "toggle_notify_always":
-        # уже есть выше, но если пришли из SMC-панели — обновим её
         toggle_bool_setting(chat_id, "notify_always")
-        try:
-            edit_message_reply_markup(chat_id, message_id, build_smc_cfg_keyboard(chat_id))
-        except Exception:
-            edit_message_reply_markup(chat_id, message_id, build_global_setup_keyboard(chat_id))
+        edit_message_reply_markup(chat_id, message_id, build_global_setup_keyboard(chat_id))
         answer_callback_query(callback_id)
     elif data == "instr_categories":
         edit_message_text(
