@@ -671,7 +671,7 @@ def toggle_strategy(chat_id: str, strategy_id: str) -> dict:
 
 
 # Минимальный интервал между алертами по одной паре+стратегии (минуты)
-ALERT_COOLDOWN_MINUTES = int(os.environ.get("ALERT_COOLDOWN_MINUTES", "90"))
+ALERT_COOLDOWN_MINUTES = int(os.environ.get("ALERT_COOLDOWN_MINUTES", "1440"))  # 24ч: один сетап = один алерт
 
 
 def get_last_alert_info(alert_key: str) -> Optional[dict]:
@@ -709,24 +709,11 @@ def set_last_alert_time(alert_key: str, signal_time_str: str):
 def should_skip_alert(alert_key: str, signal_time_str: str, notify_always: bool = False) -> bool:
     """
     True = не слать.
-    Кулдаун ВСЕГДА действует (даже если «уведомлять всегда»):
-      один алерт на пару+стратегию+направление раз в ALERT_COOLDOWN_MINUTES.
+    Каждый конкретный сетап (setup_id) отправляется ровно один раз.
+    Новый сетап = новый setup_id = новый алерт.
     """
     info = get_last_alert_info(alert_key)
-    if not info:
-        return False
-    if info["signal_time"] == signal_time_str:
-        return True
-    try:
-        sent_at = datetime.fromisoformat(info["sent_at"])
-        if sent_at.tzinfo is None:
-            sent_at = sent_at.replace(tzinfo=timezone.utc)
-        elapsed = (datetime.now(timezone.utc) - sent_at).total_seconds() / 60.0
-        if elapsed < ALERT_COOLDOWN_MINUTES:
-            return True
-    except Exception:
-        pass
-    return False
+    return info is not None
 
 
 def get_update_offset() -> int:
@@ -777,6 +764,7 @@ def find_fvg(df):
 
 
 def check_sweep(df):
+    """Возвращает dict {type, time} или None. time — свеча свипа (4H)."""
     if len(df) < 10:
         return None
     recent_high = df["High"].iloc[-10:-1].max()
@@ -784,11 +772,12 @@ def check_sweep(df):
     current_high = df["High"].iloc[-1]
     current_low = df["Low"].iloc[-1]
     current_close = df["Close"].iloc[-1]
+    t = df.index[-1]
 
     if current_high > recent_high and current_close < recent_high:
-        return "Bearish Sweep"
+        return {"type": "Bearish Sweep", "time": t}
     if current_low < recent_low and current_close > recent_low:
-        return "Bullish Sweep"
+        return {"type": "Bullish Sweep", "time": t}
     return None
 
 
@@ -832,13 +821,13 @@ def detect_smc_sweep_fvg(df_4h, df_15m, settings):
     if settings.get("smc_trigger_sweep", True):
         sweep = check_sweep(df_4h)
         if sweep:
-            direction = "Bullish" if sweep == "Bullish Sweep" else "Bearish"
-            active_triggers.append(("Sweep", direction))
+            direction = "Bullish" if sweep["type"] == "Bullish Sweep" else "Bearish"
+            active_triggers.append(("Sweep", direction, sweep["time"]))
     if settings.get("smc_trigger_fvg", True):
         fvg4h = check_4h_fvg_trigger(df_4h)
         if fvg4h:
             direction = "Bullish" if fvg4h["type"] == "Bullish FVG" else "Bearish"
-            active_triggers.append(("FVG", direction))
+            active_triggers.append(("FVG", direction, fvg4h["time"]))
     if not active_triggers:
         return None
 
@@ -850,12 +839,21 @@ def detect_smc_sweep_fvg(df_4h, df_15m, settings):
         return None
 
     direction_15m = "Bullish" if last_fvg_15m["type"] == "Bullish FVG" else "Bearish"
-    matching = [label for label, d in active_triggers if d == direction_15m]
+    matching = [(label, t) for label, d, t in active_triggers if d == direction_15m]
     if not matching:
         return None
 
     direction_ru = "Лонг" if direction_15m == "Bullish" else "Шорт"
-    return {"time": last_fvg_15m["time"], "direction": direction_ru, "trigger": " + ".join(matching)}
+    labels = " + ".join(lab for lab, _ in matching)
+    # ID сетапа = 4H-триггер (не 15M FVG). Один 4H-свип = один алерт.
+    trigger_time = matching[0][1]
+    setup_id = f"smc:{direction_ru}:{trigger_time.isoformat()}"
+    return {
+        "time": last_fvg_15m["time"],
+        "direction": direction_ru,
+        "trigger": labels,
+        "setup_id": setup_id,
+    }
 
 
 def detect_bos(df_4h, df_15m, settings):
@@ -869,9 +867,19 @@ def detect_bos(df_4h, df_15m, settings):
     last_close = df_15m["Close"].iloc[-1]
     last_time = df_15m.index[-1]
     if last_close > last_high:
-        return {"time": last_time, "direction": "Лонг", "trigger": "BOS (пробой хая)"}
+        return {
+            "time": last_time,
+            "direction": "Лонг",
+            "trigger": "BOS (пробой хая)",
+            "setup_id": f"bos:long:{round(last_high, 5)}",
+        }
     if last_close < last_low:
-        return {"time": last_time, "direction": "Шорт", "trigger": "BOS (пробой лоя)"}
+        return {
+            "time": last_time,
+            "direction": "Шорт",
+            "trigger": "BOS (пробой лоя)",
+            "setup_id": f"bos:short:{round(last_low, 5)}",
+        }
     return None
 
 
@@ -905,7 +913,13 @@ def detect_order_block(df_4h, df_15m, settings):
         touched = last_low <= ob_high and last_high >= ob_low
         if touched:
             direction = "Лонг" if impulse_bullish else "Шорт"
-            return {"time": df_15m.index[-1], "direction": direction, "trigger": "Order Block retest"}
+            ob_t = df_15m.index[ob_index]
+            return {
+                "time": df_15m.index[-1],
+                "direction": direction,
+                "trigger": "Order Block retest",
+                "setup_id": f"ob:{direction}:{ob_t.isoformat()}",
+            }
     return None
 
 
@@ -921,9 +935,19 @@ def detect_ema_pullback(df_4h, df_15m, settings):
     last_high = df_15m["High"].iloc[-1]
     last_ema = ema21_15m.iloc[-1]
     if trend_up and last_low <= last_ema < last_close:
-        return {"time": df_15m.index[-1], "direction": "Лонг", "trigger": "EMA21 pullback (аптренд)"}
+        return {
+            "time": df_15m.index[-1],
+            "direction": "Лонг",
+            "trigger": "EMA21 pullback (аптренд)",
+            "setup_id": f"ema:Лонг:{df_4h.index[-1].isoformat()}",
+        }
     if trend_down and last_high >= last_ema > last_close:
-        return {"time": df_15m.index[-1], "direction": "Шорт", "trigger": "EMA21 pullback (даунтренд)"}
+        return {
+            "time": df_15m.index[-1],
+            "direction": "Шорт",
+            "trigger": "EMA21 pullback (даунтренд)",
+            "setup_id": f"ema:Шорт:{df_4h.index[-1].isoformat()}",
+        }
     return None
 
 
@@ -936,9 +960,21 @@ def detect_rsi_reversal(df_4h, df_15m, settings):
     prev_rsi = rsi.iloc[-2]
     last_rsi = rsi.iloc[-1]
     if prev_rsi < 30 <= last_rsi:
-        return {"time": df_15m.index[-1], "direction": "Лонг", "trigger": "RSI выход из перепроданности"}
+        t = df_15m.index[-1]
+        return {
+            "time": t,
+            "direction": "Лонг",
+            "trigger": "RSI выход из перепроданности",
+            "setup_id": f"rsi:Лонг:{t.isoformat()}",
+        }
     if prev_rsi > 70 >= last_rsi:
-        return {"time": df_15m.index[-1], "direction": "Шорт", "trigger": "RSI выход из перекупленности"}
+        t = df_15m.index[-1]
+        return {
+            "time": t,
+            "direction": "Шорт",
+            "trigger": "RSI выход из перекупленности",
+            "setup_id": f"rsi:Шорт:{t.isoformat()}",
+        }
     return None
 
 
@@ -2354,10 +2390,11 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
 
         direction = result["direction"]
         trigger = result["trigger"]
-        alert_key = f"{symbol_key}:{sid}:{direction}"
-        signal_time_str = result["time"].isoformat()
+        setup_id = result.get("setup_id") or result["time"].isoformat()
+        alert_key = f"{symbol_key}:{sid}:{setup_id}"
+        signal_time_str = str(setup_id)
         if should_skip_alert(alert_key, signal_time_str):
-            fired_statuses.append(f"{strat['label']}: кулдаун / уже отправлено")
+            fired_statuses.append(f"{strat['label']}: этот сетап уже отправлен")
             continue
         fired_statuses.append(f"🔥 {strat['label']}: {direction}")
 
