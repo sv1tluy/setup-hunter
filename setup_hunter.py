@@ -266,7 +266,7 @@ INSTRUMENT_CATEGORIES = {
 
 DEFAULT_SETTINGS = {
     "symbols": ["FX_EURUSD", "FX_GBPUSD", "MT_XAUUSD_GCF", "CR_BTC", "CR_ETH", "CR_SOL"],
-    "enabled_strategies": ["smc_sweep_fvg"],
+    "enabled_strategies": ["smc_liq_bos_ob"],
     "smc_trigger_sweep": True,
     "smc_trigger_fvg": True,
     "notify_always": False,
@@ -1027,7 +1027,149 @@ def detect_rsi_reversal(df_4h, df_15m, settings):
     return None
 
 
+def htf_structure_trend(df_4h) -> Optional[str]:
+    """HH/HL = Лонг, LH/LL = Шорт, иначе None."""
+    if df_4h is None or len(df_4h) < 20:
+        return None
+    highs, lows = find_swings(df_4h, lookback=2)
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    hh = highs[-1][1] > highs[-2][1]
+    hl = lows[-1][1] > lows[-2][1]
+    lh = highs[-1][1] < highs[-2][1]
+    ll = lows[-1][1] < lows[-2][1]
+    if hh and hl:
+        return "Лонг"
+    if lh and ll:
+        return "Шорт"
+    return None
+
+
+def detect_smc_liq_bos_ob(df_4h, df_15m, settings):
+    """
+    Liquidity Sweep + BOS + OB/FVG по тренду H4.
+    Алерт: цепочка собралась на M15, зона для лимитки есть.
+    """
+    trend = htf_structure_trend(df_4h)
+    if trend is None:
+        return None
+    if df_15m is None or len(df_15m) < 30:
+        return None
+
+    highs, lows = find_swings(df_15m, lookback=3)
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+
+    look = min(24, len(df_15m) - 2)
+    sweep_i = None
+    sweep_lvl = None
+    bos_i = None
+
+    if trend == "Лонг":
+        # свип лоя: вынос ниже локального свинга и закрытие обратно выше
+        for i in range(len(df_15m) - look, len(df_15m) - 1):
+            prior_lows = [lv for t, lv in lows if t < df_15m.index[i]]
+            if not prior_lows:
+                continue
+            lvl = prior_lows[-1]
+            if df_15m["Low"].iloc[i] < lvl and df_15m["Close"].iloc[i] > lvl:
+                sweep_i, sweep_lvl = i, lvl
+        if sweep_i is None:
+            return None
+        # BOS: после свипа закрытие выше локального хая, который был до/на свипе
+        prior_highs = [hv for t, hv in highs if t <= df_15m.index[sweep_i]]
+        if not prior_highs:
+            return None
+        bos_lvl = prior_highs[-1]
+        for j in range(sweep_i + 1, len(df_15m)):
+            if df_15m["Close"].iloc[j] > bos_lvl:
+                bos_i = j
+                break
+        if bos_i is None:
+            return None
+        # слишком старый BOS — не «вовремя»
+        if bos_i < len(df_15m) - 10:
+            return None
+        # OB: последняя медвежья свеча перед импульсом (sweep→bos)
+        ob = None
+        for k in range(bos_i - 1, sweep_i - 1, -1):
+            if df_15m["Close"].iloc[k] < df_15m["Open"].iloc[k]:
+                ob = (float(df_15m["Low"].iloc[k]), float(df_15m["High"].iloc[k]), df_15m.index[k])
+                break
+        fvgs = [f for f in find_fvg(df_15m.iloc[sweep_i : bos_i + 1]) if f["type"] == "Bullish FVG"]
+        zone = None
+        zname = None
+        if ob:
+            zone, zname = (ob[1], ob[0]), "OB"
+        elif fvgs:
+            f = fvgs[-1]
+            zone, zname = (f["top"], f["bottom"]), "FVG"
+        else:
+            return None
+        last_low, last_high = float(df_15m["Low"].iloc[-1]), float(df_15m["High"].iloc[-1])
+        touching = last_low <= zone[0] and last_high >= zone[1]
+        stage = "ретест зоны" if touching else "BOS есть, ждать ретест"
+        setup_id = f"lsb:Лонг:{df_15m.index[sweep_i].isoformat()}:{df_15m.index[bos_i].isoformat()}"
+        return {
+            "time": df_15m.index[bos_i],
+            "direction": "Лонг",
+            "trigger": f"Sweep+BOS+{zname} ({stage})",
+            "setup_id": setup_id,
+        }
+
+    # Шорт — зеркало
+    for i in range(len(df_15m) - look, len(df_15m) - 1):
+        prior_highs = [hv for t, hv in highs if t < df_15m.index[i]]
+        if not prior_highs:
+            continue
+        lvl = prior_highs[-1]
+        if df_15m["High"].iloc[i] > lvl and df_15m["Close"].iloc[i] < lvl:
+            sweep_i, sweep_lvl = i, lvl
+    if sweep_i is None:
+        return None
+    prior_lows = [lv for t, lv in lows if t <= df_15m.index[sweep_i]]
+    if not prior_lows:
+        return None
+    bos_lvl = prior_lows[-1]
+    for j in range(sweep_i + 1, len(df_15m)):
+        if df_15m["Close"].iloc[j] < bos_lvl:
+            bos_i = j
+            break
+    if bos_i is None or bos_i < len(df_15m) - 10:
+        return None
+    ob = None
+    for k in range(bos_i - 1, sweep_i - 1, -1):
+        if df_15m["Close"].iloc[k] > df_15m["Open"].iloc[k]:
+            ob = (float(df_15m["Low"].iloc[k]), float(df_15m["High"].iloc[k]), df_15m.index[k])
+            break
+    fvgs = [f for f in find_fvg(df_15m.iloc[sweep_i : bos_i + 1]) if f["type"] == "Bearish FVG"]
+    zone = None
+    zname = None
+    if ob:
+        zone, zname = (ob[1], ob[0]), "OB"
+    elif fvgs:
+        f = fvgs[-1]
+        zone, zname = (f["top"], f["bottom"]), "FVG"
+    else:
+        return None
+    last_low, last_high = float(df_15m["Low"].iloc[-1]), float(df_15m["High"].iloc[-1])
+    touching = last_low <= zone[0] and last_high >= zone[1]
+    stage = "ретест зоны" if touching else "BOS есть, ждать ретест"
+    setup_id = f"lsb:Шорт:{df_15m.index[sweep_i].isoformat()}:{df_15m.index[bos_i].isoformat()}"
+    return {
+        "time": df_15m.index[bos_i],
+        "direction": "Шорт",
+        "trigger": f"Sweep+BOS+{zname} ({stage})",
+        "setup_id": setup_id,
+    }
+
+
 STRATEGIES = {
+    "smc_liq_bos_ob": {
+        "label": "SMC: Sweep + BOS + OB/FVG",
+        "detect": detect_smc_liq_bos_ob,
+        "configurable": False,
+    },
     "smc_sweep_fvg": {
         "label": "SMC: 4H Sweep/FVG + 15M FVG",
         "detect": detect_smc_sweep_fvg,
@@ -1348,41 +1490,53 @@ def format_lot_line(settings: dict, symbol_key: str, direction: str, entry: floa
     return f"Лот: <b>{size_s}</b> {calc['size_label']} · риск ${calc['risk_usd']:.0f}"
 
 
-def tradingview_url(instrument_key: str) -> str:
-    """Ссылка на TradingView для инструмента."""
+def tradingview_symbol(instrument_key: str) -> str:
     info = AVAILABLE_INSTRUMENTS.get(instrument_key, {})
     kind = info.get("kind", "")
     ticker = info.get("ticker", "")
-    label = info.get("label", "")
-
     if kind == "crypto":
-        # BTC/USDT → BINANCE:BTCUSDT (самый популярный)
-        base = ticker.replace("/", "")
-        return f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}"
+        return f"BINANCE:{ticker.replace('/', '')}"
     if kind == "crypto_perp":
-        base = ticker.replace("USDT", "USDT")
-        return f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}.P"
+        base = ticker.replace("/", "")
+        if not base.endswith("USDT"):
+            base = f"{base}USDT" if "USDT" not in base else base
+        return f"BINANCE:{base}.P"
     if kind == "forex":
-        # EURUSD=X → FX:EURUSD
-        sym = ticker.replace("=X", "").replace("=F", "")
         if "GC" in ticker:
-            return "https://www.tradingview.com/chart/?symbol=COMEX:GC1!"
+            return "COMEX:GC1!"
         if "SI" in ticker:
-            return "https://www.tradingview.com/chart/?symbol=COMEX:SI1!"
-        return f"https://www.tradingview.com/chart/?symbol=FX:{sym}"
+            return "COMEX:SI1!"
+        sym = ticker.replace("=X", "").replace("=F", "")
+        return f"FX:{sym}"
     if kind == "equity":
-        return f"https://www.tradingview.com/chart/?symbol=NASDAQ:{ticker}"
-    return "https://www.tradingview.com/"
+        return f"NASDAQ:{ticker}"
+    return ticker or "BINANCE:BTCUSDT"
+
+
+def tradingview_url(instrument_key: str, interval: str = "15") -> str:
+    """Ссылка на TV: откроет приложение/сайт на нужном символе и ТФ."""
+    sym = tradingview_symbol(instrument_key)
+    return f"https://www.tradingview.com/chart/?symbol={sym}&interval={interval}"
+
+
+def tradingview_links_html(instrument_key: str) -> str:
+    h4 = tradingview_url(instrument_key, "240")
+    m15 = tradingview_url(instrument_key, "15")
+    m5 = tradingview_url(instrument_key, "5")
+    return (
+        f'<a href="{h4}">TV H4</a> · '
+        f'<a href="{m15}">TV M15</a> · '
+        f'<a href="{m5}">TV M5</a>'
+    )
 
 
 def build_alert_keyboard(instrument_key: str) -> dict:
-    """Кнопки в одну линию — как синие ссылки в примере."""
-    tv = tradingview_url(instrument_key)
     return {
         "inline_keyboard": [
             [
-                {"text": "Открыть в TradingView", "url": tv},
-                {"text": "Настройки сетапа", "callback_data": "open_smc_settings"},
+                {"text": "TV H4", "url": tradingview_url(instrument_key, "240")},
+                {"text": "TV M15", "url": tradingview_url(instrument_key, "15")},
+                {"text": "TV M5", "url": tradingview_url(instrument_key, "5")},
             ]
         ]
     }
@@ -2017,8 +2171,7 @@ def handle_command(chat_id, text, thread_id=None):
                 s = get_user_settings(str(CHAT_ID))
             lot_line = format_lot_line(s, symbol_key, "Лонг", last_close, levels["sl"])
             caption = format_alert_caption(label, "Лонг", "FVG", last_close, levels, lot_line, test=True)
-            tv = tradingview_url(symbol_key)
-            caption += f'\n<a href="{tv}">Открыть в TradingView</a>'
+            caption += "\n" + tradingview_links_html(symbol_key)
             send_telegram_media_group(imgs, caption=caption, message_thread_id=SCREENER_TOPIC_ID)
             send_message(chat_id, "✅ Тестовый алерт отправлен в тему «Скринер»", message_thread_id=thread_id)
             for p in imgs:
@@ -2603,8 +2756,7 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
             caption = format_alert_caption(
                 label, direction, trigger, last_close, levels, lot_line, test=False
             )
-            tv = tradingview_url(symbol_key)
-            caption += f'\n<a href="{tv}">Открыть в TradingView</a>'
+            caption += "\n" + tradingview_links_html(symbol_key)
 
             send_telegram_media_group(
                 imgs,
