@@ -1045,120 +1045,165 @@ def htf_structure_trend(df_4h) -> Optional[str]:
     return None
 
 
+def _m15_atr(df, period=14) -> float:
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = float(tr.rolling(period).mean().iloc[-1])
+    return atr if atr and atr > 0 else float(df["Close"].iloc[-1]) * 0.001
+
+
+def _pair_currencies(symbol_key: str) -> set:
+    info = AVAILABLE_INSTRUMENTS.get(symbol_key) or {}
+    kind = info.get("kind") or ""
+    if kind in ("crypto", "crypto_perp") or (symbol_key or "").startswith("CR_"):
+        return set()
+    label = (info.get("label") or symbol_key).upper().replace("USDT", "")
+    tick = (info.get("ticker") or "").upper().replace("USDT", "")
+    found = set()
+    for ccy in ("USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"):
+        if ccy in label or ccy in tick or ccy in (symbol_key or "").upper().replace("USDT", ""):
+            found.add(ccy)
+    if "XAU" in label or "GC=" in tick or "GOLD" in label:
+        found.update({"USD", "XAU"})
+    if "XAG" in label or "SI=" in tick:
+        found.update({"USD", "XAG"})
+    return found
+
+
+def news_blocks_pair(symbol_key: str, minutes: int = 20) -> bool:
+    """True = рядом high-новость по валюте пары — сетап не шлём."""
+    info = AVAILABLE_INSTRUMENTS.get(symbol_key) or {}
+    if (info.get("kind") in ("crypto", "crypto_perp")) or (symbol_key or "").startswith("CR_"):
+        return False
+    try:
+        events = fetch_forexfactory_events()
+    except Exception:
+        return False
+    now = datetime.now(timezone.utc)
+    ccys = _pair_currencies(symbol_key)
+    if not ccys:
+        return False
+    for e in events:
+        if e.get("impact") != "high" or e.get("datetime_utc") is None:
+            continue
+        cur = (e.get("currency") or "").upper()
+        hits = cur in ccys or (cur == "USD" and (("USD" in ccys) or ("XAU" in ccys) or ("XAG" in ccys)))
+        if not hits:
+            continue
+        delta = abs((e["datetime_utc"] - now).total_seconds()) / 60.0
+        if delta <= minutes:
+            return True
+    return False
+
+
 def detect_smc_liq_bos_ob(df_4h, df_15m, settings):
     """
-    Liquidity Sweep + BOS + OB/FVG по тренду H4.
-    Алерт: цепочка собралась на M15, зона для лимитки есть.
+    Чистый сетап: тренд H4 → sweep M15 (≥0.35 ATR) → BOS с импульсом → OB/FVG.
+    Алерт только когда зона актуальна: свежий BOS или ретест.
     """
     trend = htf_structure_trend(df_4h)
-    if trend is None:
+    if trend is None or df_15m is None or len(df_15m) < 40:
         return None
-    if df_15m is None or len(df_15m) < 30:
+
+    symbol_key = settings.get("_symbol") or ""
+    if symbol_key and news_blocks_pair(symbol_key, minutes=20):
         return None
 
     highs, lows = find_swings(df_15m, lookback=3)
     if len(highs) < 2 or len(lows) < 2:
         return None
 
-    look = min(24, len(df_15m) - 2)
-    sweep_i = None
-    sweep_lvl = None
-    bos_i = None
+    atr = _m15_atr(df_15m)
+    min_wick = atr * 0.35
+    look = min(36, len(df_15m) - 2)
+    is_long = trend == "Лонг"
 
-    if trend == "Лонг":
-        # свип лоя: вынос ниже локального свинга и закрытие обратно выше
-        for i in range(len(df_15m) - look, len(df_15m) - 1):
-            prior_lows = [lv for t, lv in lows if t < df_15m.index[i]]
-            if not prior_lows:
-                continue
-            lvl = prior_lows[-1]
-            if df_15m["Low"].iloc[i] < lvl and df_15m["Close"].iloc[i] > lvl:
-                sweep_i, sweep_lvl = i, lvl
-        if sweep_i is None:
-            return None
-        # BOS: после свипа закрытие выше локального хая, который был до/на свипе
-        prior_highs = [hv for t, hv in highs if t <= df_15m.index[sweep_i]]
-        if not prior_highs:
-            return None
-        bos_lvl = prior_highs[-1]
-        for j in range(sweep_i + 1, len(df_15m)):
-            if df_15m["Close"].iloc[j] > bos_lvl:
-                bos_i = j
-                break
-        if bos_i is None:
-            return None
-        # слишком старый BOS — не «вовремя»
-        if bos_i < len(df_15m) - 10:
-            return None
-        # OB: последняя медвежья свеча перед импульсом (sweep→bos)
-        ob = None
-        for k in range(bos_i - 1, sweep_i - 1, -1):
-            if df_15m["Close"].iloc[k] < df_15m["Open"].iloc[k]:
-                ob = (float(df_15m["Low"].iloc[k]), float(df_15m["High"].iloc[k]), df_15m.index[k])
-                break
-        fvgs = [f for f in find_fvg(df_15m.iloc[sweep_i : bos_i + 1]) if f["type"] == "Bullish FVG"]
-        zone = None
-        zname = None
-        if ob:
-            zone, zname = (ob[1], ob[0]), "OB"
-        elif fvgs:
-            f = fvgs[-1]
-            zone, zname = (f["top"], f["bottom"]), "FVG"
-        else:
-            return None
-        last_low, last_high = float(df_15m["Low"].iloc[-1]), float(df_15m["High"].iloc[-1])
-        touching = last_low <= zone[0] and last_high >= zone[1]
-        stage = "ретест зоны" if touching else "BOS есть, ждать ретест"
-        setup_id = f"lsb:Лонг:{df_15m.index[sweep_i].isoformat()}:{df_15m.index[bos_i].isoformat()}"
-        return {
-            "time": df_15m.index[bos_i],
-            "direction": "Лонг",
-            "trigger": f"Sweep+BOS+{zname} ({stage})",
-            "setup_id": setup_id,
-        }
-
-    # Шорт — зеркало
+    sweep_i = sweep_lvl = None
     for i in range(len(df_15m) - look, len(df_15m) - 1):
-        prior_highs = [hv for t, hv in highs if t < df_15m.index[i]]
-        if not prior_highs:
-            continue
-        lvl = prior_highs[-1]
-        if df_15m["High"].iloc[i] > lvl and df_15m["Close"].iloc[i] < lvl:
-            sweep_i, sweep_lvl = i, lvl
+        t = df_15m.index[i]
+        if is_long:
+            prior = [lv for ts, lv in lows if ts < t]
+            if not prior:
+                continue
+            lvl = prior[-1]
+            wick = lvl - float(df_15m["Low"].iloc[i])
+            if float(df_15m["Low"].iloc[i]) < lvl and float(df_15m["Close"].iloc[i]) > lvl and wick >= min_wick:
+                sweep_i, sweep_lvl = i, lvl
+        else:
+            prior = [hv for ts, hv in highs if ts < t]
+            if not prior:
+                continue
+            lvl = prior[-1]
+            wick = float(df_15m["High"].iloc[i]) - lvl
+            if float(df_15m["High"].iloc[i]) > lvl and float(df_15m["Close"].iloc[i]) < lvl and wick >= min_wick:
+                sweep_i, sweep_lvl = i, lvl
     if sweep_i is None:
         return None
-    prior_lows = [lv for t, lv in lows if t <= df_15m.index[sweep_i]]
-    if not prior_lows:
+
+    t_sw = df_15m.index[sweep_i]
+    if is_long:
+        prior_lvl = [hv for ts, hv in highs if ts < t_sw]
+    else:
+        prior_lvl = [lv for ts, lv in lows if ts < t_sw]
+    if not prior_lvl:
         return None
-    bos_lvl = prior_lows[-1]
+    bos_lvl = prior_lvl[-1]
+    bos_i = None
     for j in range(sweep_i + 1, len(df_15m)):
-        if df_15m["Close"].iloc[j] < bos_lvl:
+        cl = float(df_15m["Close"].iloc[j])
+        body = abs(float(df_15m["Close"].iloc[j]) - float(df_15m["Open"].iloc[j]))
+        if is_long and cl > bos_lvl and body >= atr * 0.25:
             bos_i = j
             break
-    if bos_i is None or bos_i < len(df_15m) - 10:
-        return None
-    ob = None
-    for k in range(bos_i - 1, sweep_i - 1, -1):
-        if df_15m["Close"].iloc[k] > df_15m["Open"].iloc[k]:
-            ob = (float(df_15m["Low"].iloc[k]), float(df_15m["High"].iloc[k]), df_15m.index[k])
+        if (not is_long) and cl < bos_lvl and body >= atr * 0.25:
+            bos_i = j
             break
-    fvgs = [f for f in find_fvg(df_15m.iloc[sweep_i : bos_i + 1]) if f["type"] == "Bearish FVG"]
-    zone = None
-    zname = None
+    if bos_i is None:
+        return None
+    # зона жива до ~8 часов после BOS
+    if bos_i < len(df_15m) - 32:
+        return None
+
+    def _is_ob_candle(k: int) -> bool:
+        bear = float(df_15m["Close"].iloc[k]) < float(df_15m["Open"].iloc[k])
+        return bear if is_long else (not bear)
+
+    ob = None
+    # 1) свеча сразу перед свипом — классический OB
+    for k in range(sweep_i - 1, max(0, sweep_i - 7), -1):
+        if _is_ob_candle(k):
+            ob = (float(df_15m["High"].iloc[k]), float(df_15m["Low"].iloc[k]))
+            break
+    # 2) иначе последняя противоположная внутри импульса sweep→BOS
+    if ob is None:
+        for k in range(bos_i - 1, sweep_i - 1, -1):
+            if _is_ob_candle(k):
+                ob = (float(df_15m["High"].iloc[k]), float(df_15m["Low"].iloc[k]))
+                break
+    want = "Bullish FVG" if is_long else "Bearish FVG"
+    fvgs = [f for f in find_fvg(df_15m.iloc[sweep_i : bos_i + 1]) if f["type"] == want]
     if ob:
-        zone, zname = (ob[1], ob[0]), "OB"
+        zone_top, zone_bot, zname = ob[0], ob[1], "OB"
     elif fvgs:
         f = fvgs[-1]
-        zone, zname = (f["top"], f["bottom"]), "FVG"
+        zone_top, zone_bot, zname = f["top"], f["bottom"], "FVG"
     else:
         return None
-    last_low, last_high = float(df_15m["Low"].iloc[-1]), float(df_15m["High"].iloc[-1])
-    touching = last_low <= zone[0] and last_high >= zone[1]
-    stage = "ретест зоны" if touching else "BOS есть, ждать ретест"
-    setup_id = f"lsb:Шорт:{df_15m.index[sweep_i].isoformat()}:{df_15m.index[bos_i].isoformat()}"
+
+    last_low = float(df_15m["Low"].iloc[-1])
+    last_high = float(df_15m["High"].iloc[-1])
+    touching = last_low <= zone_top and last_high >= zone_bot
+    fresh_bos = bos_i >= len(df_15m) - 4
+    if not touching and not fresh_bos:
+        return None
+
+    stage = "ретест зоны" if touching else "лимитка в зону"
+    setup_id = f"lsb:{trend}:{df_15m.index[sweep_i].isoformat()}:{df_15m.index[bos_i].isoformat()}"
     return {
-        "time": df_15m.index[bos_i],
-        "direction": "Шорт",
+        "time": df_15m.index[-1] if touching else df_15m.index[bos_i],
+        "direction": trend,
         "trigger": f"Sweep+BOS+{zname} ({stage})",
         "setup_id": setup_id,
     }
@@ -2696,7 +2741,9 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
         if not strat:
             continue
         try:
-            result = strat["detect"](df_4h, df_15m, settings)
+            local_settings = dict(settings)
+            local_settings["_symbol"] = symbol_key
+            result = strat["detect"](df_4h, df_15m, local_settings)
         except Exception as e:
             log.error(f"Ошибка стратегии {sid} на {symbol_key}: {e}")
             continue
@@ -2849,6 +2896,9 @@ def _ff_day_url(dt: datetime = None) -> str:
     return f"https://www.forexfactory.com/calendar?day={dt.strftime('%b%d.%Y').lower()}"
 
 
+_FF_CACHE = {"key": None, "ts": 0.0, "events": []}
+
+
 def fetch_forexfactory_events(for_date: datetime = None) -> List[dict]:
     """
     Парсит календарь FF на день.
@@ -2856,6 +2906,12 @@ def fetch_forexfactory_events(for_date: datetime = None) -> List[dict]:
       {title, currency, impact, time_str, datetime_utc, forecast, previous, actual}
     impact: high / medium / low / holiday / unknown
     """
+    dt = for_date or datetime.now(timezone.utc)
+    cache_key = dt.strftime("%Y-%m-%d")
+    now_ts = time.time()
+    if _FF_CACHE["key"] == cache_key and (now_ts - _FF_CACHE["ts"]) < 300 and _FF_CACHE["events"]:
+        return _FF_CACHE["events"]
+
     try:
         from bs4 import BeautifulSoup
     except ImportError:
@@ -2977,6 +3033,9 @@ def fetch_forexfactory_events(for_date: datetime = None) -> List[dict]:
             continue
 
     log.info(f"FF calendar: {len(events)} events for {current_date}")
+    _FF_CACHE["key"] = cache_key
+    _FF_CACHE["ts"] = time.time()
+    _FF_CACHE["events"] = events
     return events
 
 
