@@ -151,8 +151,8 @@ FX_INSTRUMENTS = {
 }
 
 MT_INSTRUMENTS = {
-    "MT_XAUUSD": {"label": "XAU/USD (форекс)", "kind": "forex", "ticker": "XAUUSD=X"},
-    "MT_XAGUSD": {"label": "XAG/USD (форекс)", "kind": "forex", "ticker": "XAGUSD=X"},
+    "MT_XAUUSD": {"label": "XAU/USD (форекс)", "kind": "forex", "ticker": "GC=F"},
+    "MT_XAGUSD": {"label": "XAG/USD (форекс)", "kind": "forex", "ticker": "SI=F"},
     "MT_XAUUSD_GCF": {"label": "XAU/USD (COMEX фьючерс)", "kind": "forex", "ticker": "GC=F"},
     "MT_XAUUSDT_PERP": {"label": "XAU/USDT (перп)", "kind": "crypto_perp", "ticker": "XAUUSDT"},
     "MT_XAGUSD_SIF": {"label": "XAG/USD (COMEX фьючерс)", "kind": "forex", "ticker": "SI=F"},
