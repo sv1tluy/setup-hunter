@@ -26,7 +26,7 @@ import pandas as pd
 import mplfinance as mpf
 import yfinance as yf
 import ccxt
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, Response
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -54,13 +54,31 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID", "-1003970795061")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # задай в Render Environment
+# Прокси для FF / бирж, которые режут датацентр Render (403 CloudFront)
+# Пример: http://user:pass@host:port   или   socks5h://user:pass@host:1080
+PROXY_URL = (
+    os.environ.get("PROXY_URL")
+    or os.environ.get("HTTPS_PROXY")
+    or os.environ.get("HTTP_PROXY")
+    or ""
+).strip()
+
+
+def request_proxies():
+    if not PROXY_URL:
+        return None
+    return {"http": PROXY_URL, "https": PROXY_URL}
 
 # Жёстко прописанные thread_id из /whereami (можно переопределить env)
 SCREENER_TOPIC_ID = int(os.environ.get("SCREENER_TOPIC_ID", "2"))
 NEWS_TOPIC_ID = int(os.environ.get("NEWS_TOPIC_ID", "3"))
-# JOURNAL_TOPIC_ID = 4  — скипаем
+JOURNAL_TOPIC_ID = int(os.environ.get("JOURNAL_TOPIC_ID", "4"))
 AI_TOPIC_ID = int(os.environ.get("AI_TOPIC_ID", "5"))
 MARKET_TOPIC_ID = int(os.environ.get("MARKET_TOPIC_ID", "6"))
+JOURNAL_WEBAPP_URL = os.environ.get(
+    "JOURNAL_WEBAPP_URL",
+    "https://setup-hunter.onrender.com/journal",
+).strip()
 OVERVIEW_TZ = os.environ.get("OVERVIEW_TZ", "Europe/Moscow")
 OVERVIEW_MORNING_HOUR = int(os.environ.get("OVERVIEW_MORNING_HOUR", "8"))
 OVERVIEW_WEEKLY_HOUR = int(os.environ.get("OVERVIEW_WEEKLY_HOUR", "10"))
@@ -84,6 +102,7 @@ BOT_COMMANDS = [
     {"command": "news", "description": "Новости Forex Factory"},
     {"command": "brief", "description": "Утренний обзор рынка"},
     {"command": "weekplan", "description": "Торговый план на неделю"},
+    {"command": "journal", "description": "Открыть журнал (Web App)"},
     {"command": "risk", "description": "Риск-профиль / депозит / prop"},
     {"command": "deposit", "description": "Задать депозит: /deposit 10000"},
     {"command": "riskpct", "description": "Риск %: /riskpct 1"},
@@ -132,9 +151,11 @@ FX_INSTRUMENTS = {
 }
 
 MT_INSTRUMENTS = {
+    "MT_XAUUSD": {"label": "XAU/USD (форекс)", "kind": "forex", "ticker": "XAUUSD=X"},
+    "MT_XAGUSD": {"label": "XAG/USD (форекс)", "kind": "forex", "ticker": "XAGUSD=X"},
     "MT_XAUUSD_GCF": {"label": "XAU/USD (COMEX фьючерс)", "kind": "forex", "ticker": "GC=F"},
     "MT_XAUUSDT_PERP": {"label": "XAU/USDT (перп)", "kind": "crypto_perp", "ticker": "XAUUSDT"},
-    "MT_XAGUSD_SIF": {"label": "XAG/USD (COMEX фьючерс, серебро)", "kind": "forex", "ticker": "SI=F"},
+    "MT_XAGUSD_SIF": {"label": "XAG/USD (COMEX фьючерс)", "kind": "forex", "ticker": "SI=F"},
 }
 
 NQ_TICKERS = [
@@ -159,7 +180,11 @@ NQ_INSTRUMENTS = {
 
 def _make_exchange(exchange_id: str, market_type: str):
     exchange_class = getattr(ccxt, exchange_id)
-    return exchange_class({"enableRateLimit": True, "options": {"defaultType": market_type}})
+    cfg = {"enableRateLimit": True, "options": {"defaultType": market_type}}
+    if PROXY_URL:
+        cfg["proxies"] = {"http": PROXY_URL, "https": PROXY_URL}
+        cfg["timeout"] = 25000
+    return exchange_class(cfg)
 
 
 def init_crypto_exchanges() -> str:
@@ -247,7 +272,7 @@ AVAILABLE_INSTRUMENTS = {**FX_INSTRUMENTS, **MT_INSTRUMENTS, **CR_INSTRUMENTS, *
 OVERVIEW_ASSET_KEYS = [
     "FX_EURUSD", "FX_GBPUSD", "FX_USDJPY", "FX_USDCHF",
     "FX_AUDUSD", "FX_USDCAD", "FX_NZDUSD",
-    "MT_XAUUSD_GCF", "MT_XAGUSD_SIF",
+    "MT_XAUUSD", "MT_XAGUSD", "MT_XAUUSD_GCF", "MT_XAGUSD_SIF",
     "CR_BTC", "CR_ETH", "CR_SOL", "CR_DOGE", "CR_TON",
     "CR_XRP", "CR_BNB", "CR_AVAX", "CR_LINK",
 ]
@@ -265,8 +290,8 @@ INSTRUMENT_CATEGORIES = {
 }
 
 DEFAULT_SETTINGS = {
-    "symbols": ["FX_EURUSD", "FX_GBPUSD", "MT_XAUUSD_GCF", "CR_BTC", "CR_ETH", "CR_SOL"],
-    "enabled_strategies": ["smc_liq_bos_ob", "break_hold", "compression_break"],
+    "symbols": ["FX_EURUSD", "FX_GBPUSD", "MT_XAUUSD", "CR_BTC", "CR_ETH", "CR_SOL"],
+    "enabled_strategies": ["smc_sweep_fvg", "smc_liq_bos_ob", "break_hold", "compression_break"],
     "smc_trigger_sweep": True,
     "smc_trigger_fvg": True,
     "notify_always": False,
@@ -300,7 +325,9 @@ PIP_VALUE_HINTS = {
     "FX_USDCAD": 9.0,
     "FX_USDCHF": 10.0,
     "FX_NZDUSD": 10.0,
-    "MT_XAUUSD_GCF": 1.0,   # gold: ~$1 per 0.01 move per 0.01 lot roughly — упрощённо
+    "MT_XAUUSD": 1.0,
+    "MT_XAGUSD": 5.0,
+    "MT_XAUUSD_GCF": 1.0,
     "EQ_US100": 1.0,
     "CR_BTC": 1.0,   # $1 на $1 движения × размер позиции в монетах
     "CR_ETH": 1.0,
@@ -922,11 +949,16 @@ def detect_smc_sweep_fvg(df_4h, df_15m, settings):
     # ID сетапа = 4H-триггер (не 15M FVG). Один 4H-свип = один алерт.
     trigger_time = matching[0][1]
     setup_id = f"smc:{direction_ru}:{trigger_time.isoformat()}"
+    if direction_ru == "Лонг":
+        sl_price = float(df_4h["Low"].iloc[-1])
+    else:
+        sl_price = float(df_4h["High"].iloc[-1])
     return {
         "time": last_fvg_15m["time"],
         "direction": direction_ru,
         "trigger": labels,
         "setup_id": setup_id,
+        "sl_price": sl_price,
     }
 
 
@@ -1070,6 +1102,22 @@ def htf_structure_trend(df_4h) -> Optional[str]:
     return None
 
 
+def _is_forex_symbol(symbol_key: str) -> bool:
+    info = AVAILABLE_INSTRUMENTS.get(symbol_key) or {}
+    kind = info.get("kind") or ""
+    label = (info.get("label") or symbol_key or "").upper()
+    tick = str(info.get("ticker") or "")
+    if "XAU" in label or "XAG" in label or "GOLD" in label or "GC=" in tick or "SI=" in tick:
+        return False
+    return kind == "forex"
+
+
+def _smc_thresholds(symbol_key: str):
+    if _is_forex_symbol(symbol_key):
+        return 0.55, 0.40
+    return 0.35, 0.25
+
+
 def _m15_atr(df, period=14) -> float:
     high_low = df["High"] - df["Low"]
     high_close = (df["High"] - df["Close"].shift()).abs()
@@ -1141,7 +1189,8 @@ def detect_smc_liq_bos_ob(df_4h, df_15m, settings):
         return None
 
     atr = _m15_atr(df_15m)
-    min_wick = atr * 0.35
+    wick_k, bos_k = _smc_thresholds(symbol_key)
+    min_wick = atr * wick_k
     look = min(36, len(df_15m) - 2)
     is_long = trend == "Лонг"
 
@@ -1179,10 +1228,10 @@ def detect_smc_liq_bos_ob(df_4h, df_15m, settings):
     for j in range(sweep_i + 1, len(df_15m)):
         cl = float(df_15m["Close"].iloc[j])
         body = abs(float(df_15m["Close"].iloc[j]) - float(df_15m["Open"].iloc[j]))
-        if is_long and cl > bos_lvl and body >= atr * 0.25:
+        if is_long and cl > bos_lvl and body >= atr * bos_k:
             bos_i = j
             break
-        if (not is_long) and cl < bos_lvl and body >= atr * 0.25:
+        if (not is_long) and cl < bos_lvl and body >= atr * bos_k:
             bos_i = j
             break
     if bos_i is None:
@@ -1220,18 +1269,35 @@ def detect_smc_liq_bos_ob(df_4h, df_15m, settings):
     last_low = float(df_15m["Low"].iloc[-1])
     last_high = float(df_15m["High"].iloc[-1])
     touching = last_low <= zone_top and last_high >= zone_bot
-    fresh_bos = bos_i >= len(df_15m) - 4
-    if not touching and not fresh_bos:
+    if not touching:
+        return None
+    if not _in_killzone(df_15m.index[-1]):
         return None
 
-    stage = "ретест зоны" if touching else "лимитка в зону"
     setup_id = f"lsb:{trend}:{df_15m.index[sweep_i].isoformat()}:{df_15m.index[bos_i].isoformat()}"
+    sl_price = float(df_15m["Low"].iloc[sweep_i]) if is_long else float(df_15m["High"].iloc[sweep_i])
     return {
-        "time": df_15m.index[-1] if touching else df_15m.index[bos_i],
+        "time": df_15m.index[-1],
         "direction": trend,
-        "trigger": f"Sweep+BOS+{zname} ({stage})",
+        "trigger": f"Sweep+BOS+{zname} (ретест зоны)",
         "setup_id": setup_id,
+        "sl_price": sl_price,
     }
+
+
+def _in_killzone(ts) -> bool:
+    """Лондон + Нью-Йорк по UTC. Азия/выходные — больше ложных пробоев."""
+    try:
+        if getattr(ts, "tzinfo", None) is None:
+            hour, wd = ts.hour, ts.weekday()
+        else:
+            utc = ts.tz_convert("UTC") if hasattr(ts, "tz_convert") else ts.astimezone(timezone.utc)
+            hour, wd = utc.hour, utc.weekday()
+        if wd >= 5:
+            return False
+        return 7 <= hour <= 21
+    except Exception:
+        return True
 
 
 def detect_break_hold(df_4h, df_15m, settings):
@@ -1244,6 +1310,8 @@ def detect_break_hold(df_4h, df_15m, settings):
         return None
     symbol_key = settings.get("_symbol") or ""
     if symbol_key and news_blocks_pair(symbol_key, minutes=20):
+        return None
+    if not _in_killzone(df_15m.index[-1]):
         return None
     highs, lows = find_swings(df_15m, lookback=3)
     if len(highs) < 2 or len(lows) < 2:
@@ -1280,11 +1348,14 @@ def detect_break_hold(df_4h, df_15m, settings):
         return None
     stage = "ретест" if retest else "закреп"
     setup_id = f"bh:{trend}:{lvl_t.isoformat()}:{round(lvl, 5)}"
+    pad = atr * 0.15
+    sl_price = (lvl - pad) if is_long else (lvl + pad)
     return {
         "time": df_15m.index[-1],
         "direction": trend,
         "trigger": f"Пробой+закреп ({stage})",
         "setup_id": setup_id,
+        "sl_price": sl_price,
     }
 
 
@@ -1297,6 +1368,8 @@ def detect_compression_break(df_4h, df_15m, settings):
         return None
     symbol_key = settings.get("_symbol") or ""
     if symbol_key and news_blocks_pair(symbol_key, minutes=20):
+        return None
+    if not _in_killzone(df_15m.index[-1]):
         return None
     atr = _m15_atr(df_15m)
     box = df_15m.iloc[-16:-1]
@@ -1320,11 +1393,13 @@ def detect_compression_break(df_4h, df_15m, settings):
     if (not is_long) and (bot - last_c) < atr * 0.15:
         return None
     setup_id = f"cb:{trend}:{box.index[0].isoformat()}:{round(top,5)}:{round(bot,5)}"
+    sl_price = (bot - atr * 0.1) if is_long else (top + atr * 0.1)
     return {
         "time": df_15m.index[-1],
         "direction": trend,
         "trigger": "Выход из сжатия",
         "setup_id": setup_id,
+        "sl_price": sl_price,
     }
 
 
@@ -1517,20 +1592,46 @@ GEMINI_MODELS = [
 ]
 
 
-def _atr_levels(direction: str, last_close: float, atr: float = None) -> dict:
-    """SL/TP1/TP2 по ATR."""
+def levels_from_structure(direction: str, entry: float, sl_price: float) -> Optional[dict]:
+    """Стоп за уровень сетапа, тейк 1 к 1, TP2 = 1.5R."""
+    try:
+        sl = float(sl_price)
+        entry = float(entry)
+    except Exception:
+        return None
+    if direction == "Лонг":
+        if sl >= entry:
+            sl = entry * 0.998
+        dist = entry - sl
+        if dist <= 0:
+            return None
+        return {"sl": sl, "tp1": entry + dist, "tp2": entry + 1.5 * dist}
+    if sl <= entry:
+        sl = entry * 1.002
+    dist = sl - entry
+    if dist <= 0:
+        return None
+    return {"sl": sl, "tp1": entry - dist, "tp2": entry - 1.5 * dist}
+
+
+def _atr_levels(direction: str, last_close: float, atr: float = None, instrument_key: str = "") -> dict:
+    """SL/TP1/TP2 по ATR. На форексе тейк ближе — иначе евро не дотягивает."""
     if not atr or atr <= 0:
         atr = last_close * 0.01
+    if _is_forex_symbol(instrument_key):
+        sl_k, tp1_k, tp2_k = 1.2, 1.6, 2.6
+    else:
+        sl_k, tp1_k, tp2_k = 1.5, 2.0, 3.5
     if direction == "Лонг":
         return {
-            "sl": last_close - 1.5 * atr,
-            "tp1": last_close + 2.0 * atr,
-            "tp2": last_close + 3.5 * atr,
+            "sl": last_close - sl_k * atr,
+            "tp1": last_close + tp1_k * atr,
+            "tp2": last_close + tp2_k * atr,
         }
     return {
-        "sl": last_close + 1.5 * atr,
-        "tp1": last_close - 2.0 * atr,
-        "tp2": last_close - 3.5 * atr,
+        "sl": last_close + sl_k * atr,
+        "tp1": last_close - tp1_k * atr,
+        "tp2": last_close - tp2_k * atr,
     }
 
 
@@ -1595,11 +1696,11 @@ def _gemini_generate(prompt: str) -> str:
     raise RuntimeError(str(last_err) if last_err else "empty")
 
 
-def get_ai_levels(label: str, direction: str, trigger: str, last_close: float, atr: float = None) -> dict:
+def get_ai_levels(label: str, direction: str, trigger: str, last_close: float, atr: float = None, instrument_key: str = "") -> dict:
     """
     Возвращает {sl, tp1, tp2} — из AI или ATR.
     """
-    levels = _atr_levels(direction, last_close, atr)
+    levels = _atr_levels(direction, last_close, atr, instrument_key)
     if not GEMINI_API_KEY:
         return levels
     prompt = (
@@ -1677,10 +1778,14 @@ def tradingview_symbol(instrument_key: str) -> str:
             base = f"{base}USDT" if "USDT" not in base else base
         return f"BINANCE:{base}.P"
     if kind == "forex":
-        if "GC" in ticker:
+        if ticker == "GC=F":
             return "COMEX:GC1!"
-        if "SI" in ticker:
+        if ticker == "SI=F":
             return "COMEX:SI1!"
+        if "XAUUSD" in ticker:
+            return "FX:XAUUSD"
+        if "XAGUSD" in ticker:
+            return "FX:XAGUSD"
         sym = ticker.replace("=X", "").replace("=F", "")
         return f"FX:{sym}"
     if kind == "equity":
@@ -1985,6 +2090,14 @@ GLOBAL_SETUP_TEXT = (
 )
 
 
+def build_journal_keyboard() -> dict:
+    return {
+        "inline_keyboard": [[
+            {"text": "Journal", "web_app": {"url": JOURNAL_WEBAPP_URL}},
+        ]]
+    }
+
+
 def build_global_setup_keyboard(chat_id):
     s = get_user_settings(chat_id)
     scan_label = "🟢 Сканирование: включено" if s["scanning_enabled"] else "🔴 Сканирование: выключено"
@@ -1999,6 +2112,7 @@ def build_global_setup_keyboard(chat_id):
 
 
 CORE_STRATEGY_BUTTONS = [
+    ("smc_sweep_fvg", "4H + 15M FVG"),
     ("smc_liq_bos_ob", "Sweep + BOS + OB"),
     ("break_hold", "Пробой + закреп"),
     ("compression_break", "Выход из сжатия"),
@@ -2288,6 +2402,13 @@ def handle_command(chat_id, text, thread_id=None):
                 send_message(CHAT_ID, text_out, message_thread_id=NEWS_TOPIC_ID)
         except Exception as e:
             send_message(chat_id, f"❌ Ошибка загрузки новостей: {e}", message_thread_id=thread_id)
+    elif text in ("/journal", "/журнал"):
+        send_message(
+            chat_id,
+            "📓 <b>Журнал сделок</b>\nНажми кнопку — откроется приложение.",
+            reply_markup=build_journal_keyboard(),
+            message_thread_id=thread_id if thread_id is not None else JOURNAL_TOPIC_ID,
+        )
     elif text in ("/brief", "/overview"):
         send_message(chat_id, "⏳ Собираю утренний обзор…", message_thread_id=thread_id)
         try:
@@ -2849,7 +2970,8 @@ def run_telegram_polling():
                     # Сообщения в теме ИИ-хелпер → AI
                     if thread_id == AI_TOPIC_ID and not text.startswith(
                         ("/setup", "/strategies", "/instruments", "/status", "/news", "/testalert",
-                         "/whereami", "/example", "/brief", "/weekplan", "/overview", "/plan", "/risk", "/deposit", "/help")
+                         "/whereami", "/example", "/brief", "/weekplan", "/overview", "/plan",
+                         "/risk", "/deposit", "/help", "/journal")
                     ):
                         handle_ai_message(chat_id, text, thread_id=thread_id)
                     else:
@@ -2939,7 +3061,10 @@ def process_pair(symbol_key, df_4h, df_15m, settings, df_5m=None):
                 render_single_chart(df_5m, f"{label} · M5", img_5m, max_bars=60, zone=zone_5m)
                 imgs.append(img_5m)
 
-            levels = get_ai_levels(label, direction, trigger, last_close, atr)
+            levels = get_ai_levels(label, direction, trigger, last_close, atr, symbol_key)
+            struct = levels_from_structure(direction, last_close, result.get("sl_price"))
+            if struct:
+                levels = struct
             lot_line = format_lot_line(settings, symbol_key, direction, last_close, levels["sl"])
             caption = format_alert_caption(
                 label, direction, trigger, last_close, levels, lot_line, test=False
@@ -3069,9 +3194,9 @@ def fetch_forexfactory_events(for_date: datetime = None) -> List[dict]:
         "Accept-Language": "en-US,en;q=0.9",
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=20)
+        resp = requests.get(url, headers=headers, timeout=25, proxies=request_proxies())
         if resp.status_code != 200:
-            log.warning(f"FF calendar HTTP {resp.status_code}")
+            log.warning(f"FF calendar HTTP {resp.status_code} proxy={'yes' if PROXY_URL else 'no'}")
             return []
         soup = BeautifulSoup(resp.text, "html.parser")
     except Exception as e:
@@ -3405,7 +3530,80 @@ def get_status():
 
 @app.route("/")
 def home():
-    return render_template("index.html")
+    try:
+        return render_template("index.html")
+    except Exception:
+        return "Trading Hub bot is running", 200
+
+
+JOURNAL_PAGE_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Journal</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { --bg:#0f1419; --card:#1a2332; --text:#e7ecf3; --muted:#8b9bb4; --acc:#3b82f6; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--text); padding:16px 16px 32px; }
+  h1 { font-size:20px; margin:8px 0 16px; }
+  .btn { display:inline-block; background:var(--acc); color:#fff; border:0; border-radius:22px;
+         padding:10px 22px; font-size:16px; font-weight:600; }
+  textarea { width:100%; min-height:120px; background:var(--card); color:var(--text);
+             border:1px solid #2a3548; border-radius:12px; padding:12px; font-size:16px; }
+  .row { display:flex; gap:8px; margin:12px 0 20px; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:12px; padding:10px 16px; font-size:15px; }
+  button.ghost { background:#243044; }
+  .note { background:var(--card); border-radius:12px; padding:12px; margin-bottom:10px; }
+  .note time { display:block; color:var(--muted); font-size:12px; margin-bottom:6px; }
+  .empty { color:var(--muted); }
+</style>
+</head>
+<body>
+  <h1>📓 Журнал</h1>
+  <textarea id="t" placeholder="Сделка, мысль, ошибка…"></textarea>
+  <div class="row">
+    <button onclick="save()">Сохранить</button>
+    <button class="ghost" onclick="clearAll()">Очистить</button>
+  </div>
+  <div id="list" class="empty">Пока пусто</div>
+<script>
+  const tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+  const KEY = "th_journal_v1";
+  function load(){ try { return JSON.parse(localStorage.getItem(KEY)||"[]"); } catch(e){ return []; } }
+  function render(){
+    const items = load();
+    const el = document.getElementById("list");
+    if (!items.length) { el.className="empty"; el.textContent="Пока пусто"; return; }
+    el.className="";
+    el.innerHTML = items.map(n => `<div class="note"><time>${n.ts}</time>${n.text.replace(/</g,"&lt;")}</div>`).join("");
+  }
+  function save(){
+    const t = document.getElementById("t").value.trim();
+    if (!t) return;
+    const items = load();
+    items.unshift({ ts: new Date().toLocaleString("ru-RU"), text: t });
+    localStorage.setItem(KEY, JSON.stringify(items.slice(0,200)));
+    document.getElementById("t").value="";
+    render();
+  }
+  function clearAll(){
+    if (!confirm("Удалить все записи?")) return;
+    localStorage.removeItem(KEY); render();
+  }
+  render();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/journal")
+def journal_page():
+    return Response(JOURNAL_PAGE_HTML, mimetype="text/html")
 
 
 # =========================================================================
